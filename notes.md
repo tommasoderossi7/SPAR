@@ -5,8 +5,10 @@ Next tasks:
 - execute full reduced pipeline on one problem: --- DONE
     $python -m utils.generate_rollout --problem-substring "3(1+3(1+3(1+3(1+3(1+3(1+3(1+3(1+3(1+3)))))))))" --alternate-top-k 2 --alternate-min-prob 0.45 --samples-per-fork 2
 - control that the functions to extract logprobs work correctly both in the base rollout and in the forking case --- DONE
-- understand the source of the problem with the token "Äł"
-- minimize the rollout_analysis.json content (there are redundant fields now probably)
+- understand the source of the problem with the token "Äł" --- DONE (it is a qwen specific tokenizer feature)
+- minimize the rollout_analysis.json content (there are redundant fields now probably) --- DONE
+- check chat (https://chatgpt.com/c/68e61c8d-e318-8330-9f41-d54cf95e6ec2) to fix weird tokens 
+- finish adjustment of distributions calculation part of the script
 - execute full pipeline on one problem
 - integrate bayesian CPD to infer the forking indices
 - estimate the average sampling costs per problem:

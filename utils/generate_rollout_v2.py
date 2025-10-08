@@ -7,6 +7,7 @@ import asyncio
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+import unicodedata, re, ftfy
 
 import numpy as np
 import httpx
@@ -347,12 +348,71 @@ async def make_api_request(
     return {"error": "All API request attempts failed"}
 
 
-# --- BPE display normalizer (for GPT-2/RoBERTa-like token strings) ---
+# --- text cleaner for model outputs ---
 def _clean_token_display(s: object) -> str:
-    """Map tokenizer artifacts to human-readable characters."""
-    s = s if isinstance(s, str) else str(s)
-    # Ġ (U+0120) marks leading space, Ċ/ċ (U+010A/U+010B) often mark newlines
-    return s.replace("\u0120", " ").replace("\u010a", "\n").replace("\u010b", "\n")
+    """
+    Make model outputs readable in logs:
+      - Fix classic mojibake (UTF-8 decoded as Latin-1/Windows-1252, etc.)
+      - Map common tokenizer artifacts to spaces/newlines
+      - Normalize Unicode and strip stray control chars (except \\n/\\t)
+      - Keep idempotent behavior on already-clean text
+    """
+    text = s if isinstance(s, str) else str(s)
+    if not text:
+        return ""
+
+    # 1) Fix classic mojibake if ftfy is available.
+    #    (e.g. 'Ã„' -> 'Ä', 'âœ”' -> '✔')
+    #    See: ftfy.fix_encoding docs.
+    if ftfy is not None:
+        text = ftfy.fix_encoding(text)
+
+    # 2) Map common tokenizer markers to human-readable whitespace.
+    #    - SentencePiece metaspace: '▁' -> ' '
+    #    - GPT-2/RoBERTa byte-level BPE: 'Ġ' (U+0120) ~ leading space,
+    #      and 'Ċ/ċ' often surface around newlines in dumps.
+    text = (
+        text.replace("▁", " ")  # SentencePiece metaspace
+        .replace("\u0120", " ")  # 'Ġ' : space-before-word
+        .replace("Ġ", " ")  # visible 'Ġ'
+        .replace("\u010a", "\n")  # 'Ċ'
+        .replace("\u010b", "\n")  # 'ċ'
+        .replace("Ċ", "\n")
+        .replace("ċ", "\n")
+    )
+
+    # (Optionally keep your legacy mappings)
+    text = text.replace("Ğ", " ").replace("ğ", " ")
+
+    # 3) Normalize and clean controls.
+    text = unicodedata.normalize("NFC", text)
+    text = "".join(ch for ch in text if (ch.isprintable() or ch in "\n\t"))
+
+    # 4) Tidy whitespace a bit (without touching newlines).
+    text = re.sub(r"[ \t]+", " ", text)
+    text = "\n".join(line.rstrip() for line in text.splitlines())
+
+    return text
+
+
+STRUCTURAL_MAP = {"Ġ": " ", "\u0120": " ", "Ċ": "\n", "\u010a": "\n", "\u010b": "\n"}
+MOJIBAKE_PREFIXES = ("Â", "Ã", "Ä", "Å", "�")
+MOJIBAKE_BAD = "�"
+
+
+def is_safe_to_fork(tok: str) -> bool:
+    if not tok:
+        return False
+    # allow structural markers (will detok when building the prompt)
+    if tok in STRUCTURAL_MAP or "▁" in tok:
+        return True
+    # keep this guard!
+    if any(unicodedata.category(c).startswith("C") and c not in "\n\t" for c in tok):
+        return False
+    # reject obvious mojibake
+    if tok.startswith(MOJIBAKE_PREFIXES) or (MOJIBAKE_BAD in tok):
+        return False
+    return True
 
 
 def extract_choice_text(choice: Dict[str, Any]) -> str:
@@ -529,11 +589,13 @@ def build_outcome_distributions(
     distributions: List[Dict[str, Any]] = []
 
     for entry, tail_logprob in zip(token_entries, tail_sums):
+        if entry.get("branches") == []:
+            continue
         distribution_weights: defaultdict[str, float] = defaultdict(float)
         base_probability = entry.get("probability") or 0.0
         if base_probability > 0:
             continuation_probability = math.exp(tail_logprob)
-            distribution_weights[base_outcome] += (
+            distribution_weights["base_greedy_completion"] += (
                 base_probability * continuation_probability
             )
 
@@ -554,10 +616,11 @@ def build_outcome_distributions(
                         continuation_probability = math.exp(logprob_sum)
                     else:
                         continuation_probability = 0.0
-                outcome = sample.get("outcome", "__unknown__")
-                distribution_weights[outcome] += (
-                    fork_probability * continuation_probability
-                )
+                distribution_weights[
+                    str(entry.get("token_index", -1))
+                    + "__"
+                    + str(sample.get("sample_idx", -1))
+                ] += fork_probability * continuation_probability
 
         accounted_probability = min(max(accounted_probability, 0.0), 1.0)
         residual_probability = max(0.0, 1.0 - accounted_probability)
@@ -582,7 +645,7 @@ def build_outcome_distributions(
             }
         )
 
-    base_distribution = {base_outcome: 1.0}
+    base_distribution = {"base_greedy_completion": 1.0}
     return distributions, base_distribution
 
 
@@ -668,8 +731,8 @@ async def collect_base_path(
         prefix_acc_raw += tok_raw
         prefix_acc_disp += tok_disp
 
-        entry["prefix_after_raw"] = prefix_acc_raw
-        entry["prefix_after"] = prefix_acc_disp
+        entry["prefix_with_alt_token_raw"] = prefix_acc_raw
+        entry["prefix_with_alt_token"] = prefix_acc_disp
 
     base_outcome = default_outcome_extractor(completion_text)
     is_correct = False
@@ -694,7 +757,11 @@ def count_potential_forking_tokens(token_entries: List[Dict[str, Any]]) -> int:
         for candidate in entry.get("top_candidates", []):
             candidate_token = candidate.get("token")
             candidate_probability = candidate.get("probability")
-            if not candidate_token or candidate_token == entry.get("token"):
+            if (
+                not candidate_token
+                or candidate_token == entry.get("token")
+                or not is_safe_to_fork(candidate_token)
+            ):
                 continue
             if not isinstance(candidate_probability, (int, float)):
                 continue
@@ -722,20 +789,54 @@ async def sample_fork_branches(
     )
     for entry in token_entries:
         branches: List[Dict[str, Any]] = []
+        entry["alt_candidates"] = []
         for candidate in entry.get("top_candidates", []):
             cand_raw = candidate.get("token_raw")
             cand_clean = candidate.get("token")
             cand_prob = candidate.get("probability")
-            if not cand_raw or cand_raw == entry.get("token_raw"):
+            if (
+                not cand_raw
+                or cand_raw == entry.get("token_raw")
+                or not is_safe_to_fork(cand_raw)
+            ):
+                # remove some fields from the entry
+                entry.pop("prefix_before_raw", None)
+                entry.pop("prefix_before", None)
+                entry.pop("prefix_with_alt_token_raw", None)
+                entry.pop("prefix_with_alt_token", None)
+                # remove candidate from the list
+                entry["top_candidates"].remove(candidate)
+                if not is_safe_to_fork(cand_raw):
+                    print(f"\nSkipping unsafe token for forking: {cand_raw}")
                 continue
             if (
                 not isinstance(cand_prob, (int, float))
                 or cand_prob < args.alternate_min_prob
             ):
+                # remove some fields from the entry
+                entry.pop("prefix_before_raw", None)
+                entry.pop("prefix_before", None)
+                entry.pop("prefix_with_alt_token_raw", None)
+                entry.pop("prefix_with_alt_token", None)
+                # remove candidate from the list
+                entry["top_candidates"].remove(candidate)
                 continue
 
             # IMPORTANT: build fork prompt from RAW prefix + RAW candidate to match model state
             fork_prompt = f"{prompt}{entry.get('prefix_before_raw', '')}{cand_raw}"
+
+            # clean up some fields from the entry to save space
+            entry.pop("prefix_before_raw", None)
+            entry.pop("prefix_before", None)
+            entry.pop("prefix_with_alt_token_raw", None)
+            # entry.pop("prefix_with_alt_token", None)
+            # remove raw token from candidate and from original CoT to save space
+            candidate.pop("token_raw", None)
+            # remove logprob from candidate to save space
+            candidate.pop("logprob", None)
+            # add candidate to the list of actually used alternate candidates
+            entry["alt_candidates"].append(candidate)
+
             tasks = [
                 make_api_request(
                     fork_prompt,
@@ -790,20 +891,26 @@ async def sample_fork_branches(
                         {"sample_index": sample_idx, "error": "No choices returned"}
                     )
                     continue
-                print(f"Prompts for forking token {cand_clean} to continue from:")
+                print(f"\nPrompt for forking token {cand_clean} to continue from:")
                 # print(f"Raw: {fork_prompt}")
                 print(
-                    f"Clean: {_clean_token_display(fork_prompt)[0:10] + '...' + _clean_token_display(fork_prompt[-10:])}"
+                    f"Clean: {_clean_token_display(fork_prompt)[0:50] + '...' + _clean_token_display(fork_prompt[-50:])}"
                 )
                 # print(f"\nSampled continuation: {sample_choices[0]}")
                 sample_choice = sample_choices[0]
                 sample_text_raw, sample_text = extract_choice_text(sample_choice)
-                print(f"Raw Response: {sample_choice['text']}")
+                print(
+                    f"\nRaw Response: {sample_choice['text'][0:100] + '...' + sample_choice['text'][-100:]}"
+                )
                 sample_tokens_raw, sample_tokens, sample_logprobs = (
                     extract_tokens_and_logprobs(sample_choice.get("logprobs"))
                 )
-                print(f"Sampled text: {sample_text}")
-                print(f"Extracted tokens: {sample_tokens}")
+                print(
+                    f"Cleaned sampled text: {sample_text[0:100] + '...' + sample_text[-100:]}"
+                )
+                print(
+                    f"Extracted tokens: {sample_tokens[0:10]} ... {sample_tokens[-10:]}"
+                )
 
                 logprob_sum = sum(
                     value
@@ -819,25 +926,30 @@ async def sample_fork_branches(
                     {
                         "sample_index": sample_idx,
                         "final_answer_text": sample_text,
-                        "tokens": sample_tokens,
+                        # "tokens": sample_tokens,
                         "logprob_sum": logprob_sum,
                         "continuation_probability": continuation_probability,
                         "outcome": outcome,
                     }
                 )
-                sys.exit(0)
+                # sys.exit(0)
 
             branches.append(
                 {
                     "token": cand_clean,
-                    "token_raw": cand_raw,
+                    # "token_raw": cand_raw,
                     "probability": cand_prob,
-                    "logprob": candidate.get("logprob"),
+                    # "logprob": candidate.get("logprob"),
                     "samples": samples,
                 }
             )
             entry["branches"] = branches
         pbar.close()
+        # remove unused fields from entry to save space
+        entry.pop("top_candidates", None)
+        entry.pop("token_raw", None)
+        entry.pop("logprob", None)
+
         entry["branches"] = branches
 
 
