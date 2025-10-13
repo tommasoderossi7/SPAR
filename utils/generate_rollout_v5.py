@@ -1,4 +1,5 @@
-# generate_rollout.py  — fork-safe, no-mojibake version
+# generate_rollout.py — progressive saves + resume from checkpoint
+
 import os
 import sys
 import json
@@ -14,8 +15,6 @@ import numpy as np
 import httpx
 from dotenv import load_dotenv
 from tqdm import tqdm
-
-# NEW: tokenizer for detok of single pieces
 from transformers import AutoTokenizer
 
 from utils.utils import (
@@ -41,7 +40,7 @@ USAGE_FILENAME = "usage.json"
 import argparse
 
 parser = argparse.ArgumentParser(
-    description="Collect forked rollouts with outcome distributions and drift analysis."
+    description="Collect forked rollouts with outcome distributions and drift analysis (progressive + resumable)."
 )
 parser.add_argument(
     "-m",
@@ -131,7 +130,6 @@ def detok_for_api(token_str: str) -> Optional[str]:
     if not isinstance(token_str, str) or token_str == "":
         return None
     tok = get_tokenizer(args.model)
-    # fast path: try vocab lookup
     tid = tok.convert_tokens_to_ids(token_str)
     if isinstance(tid, int) and tid >= 0 and tid != tok.unk_token_id:
         text = tok.decode([tid], clean_up_tokenization_spaces=False)
@@ -141,6 +139,27 @@ def detok_for_api(token_str: str) -> Optional[str]:
 
 
 # ---------------- utility & API ----------------
+
+
+def safe_write_json(path: Path, data: Dict[str, Any]) -> None:
+    """
+    Atomic-ish write: dump to a temp file and replace the target.
+    On POSIX, replace/rename updates the path in one step so readers see old or new.
+    """
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+    os.replace(tmp, path)
+
+
+def load_json_if_exists(path: Path) -> Optional[Dict[str, Any]]:
+    if not path.exists():
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
 
 
 def record_generation(
@@ -269,19 +288,13 @@ def _clean_token_display(s: object) -> str:
     return text
 
 
-# (kept for logs only)
 STRUCTURAL_MAP = {"Ġ": " ", "\u0120": " ", "Ċ": "\n", "\u010a": "\n", "\u010b": "\n"}
 
 
 def is_safe_to_fork(token_str: str) -> bool:
-    """
-    Accept if the token decodes to some text (incl. whitespace/newline).
-    We only reject if decoding fails or yields non-printable controls (other than \n/\t).
-    """
     decoded = detok_for_api(token_str)
     if decoded is None:
         return False
-    # allow newline/tabs; otherwise drop control chars
     if any(
         unicodedata.category(c).startswith("C") and c not in "\n\t" for c in decoded
     ):
@@ -339,9 +352,7 @@ def parse_logprob_entries(logprobs: Optional[Dict[str, Any]]) -> List[Dict[str, 
     tokens = logprobs.get("tokens")
     token_logprobs = logprobs.get("token_logprobs")
     top_logprobs = logprobs.get("top_logprobs")
-    text_offsets = logprobs.get("text_offset") or logprobs.get(
-        "text_offsets"
-    )  # Novita uses text_offset
+    text_offsets = logprobs.get("text_offset") or logprobs.get("text_offsets")
 
     if isinstance(tokens, list) and isinstance(token_logprobs, list):
         for idx, tok in enumerate(tokens):
@@ -458,9 +469,7 @@ def _normalize(dist: Dict[str, float]) -> Dict[str, float]:
     return {k: v / total for k, v in dist.items() if isinstance(v, (int, float))}
 
 
-# --- NEW: stable normalization from log-weights ---
 def _normalize_from_log_hist(log_hist: Dict[str, float]) -> Dict[str, float]:
-    # drop keys that never got any mass
     items = [
         (k, v)
         for k, v in log_hist.items()
@@ -468,9 +477,8 @@ def _normalize_from_log_hist(log_hist: Dict[str, float]) -> Dict[str, float]:
     ]
     if not items:
         return {}
-    # log-sum-exp trick
     m = max(v for _, v in items)
-    weights = [(k, math.exp(v - m)) for k, v in items]  # relative positive weights
+    weights = [(k, math.exp(v - m)) for k, v in items]
     Z = sum(w for _, w in weights)
     if Z <= 0:
         return {}
@@ -492,18 +500,12 @@ def build_outcome_distributions_exact(
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """
     Returns:
-      ot_list  : [{"t": int, "token": str, "dist": { outcome: prob }}, ...] (first element is o0 if provided)
-      otw_list : [{"t": int, "w": str, "p_w": float, "dist": { outcome: prob }}, ...]
-    Paper intent:
-      - o0: resample baseline (equal weights).
-      - For each t>0 and w, aggregate outcomes using continuation probability mass,
-        but do it in LOG-SPACE and normalize within-branch to get o_{t,w};
-        then mix: o_t ∝ Σ_w p(w|prefix) · o_{t,w}, renormalize over outcomes.
+      ot_list  : [{ "t": int, "token": str, "dist": { outcome: prob } }, ...] (o0 at t=-1 if provided)
+      otw_list : [{ "t": int, "w": str, "p_w": float, "dist": { outcome: prob } }, ...]
     """
     ot_list: List[Dict[str, Any]] = []
     otw_all: List[Dict[str, Any]] = []
 
-    # Prepend o0 as its own time point (t = -1) so drift can be computed against it.
     if o0_dist:
         ot_list.append({"t": -1, "token": "__o0__", "dist": dict(o0_dist)})
 
@@ -512,23 +514,18 @@ def build_outcome_distributions_exact(
         token_at_t = entry.get("token") or ""
         p_w_star = entry.get("probability") or 0.0
 
-        # (w = greedy) branch: delta at base_outcome (already normalized)
+        # Greedy branch = delta on base outcome
         ot_w_star = {}
         if isinstance(base_outcome, str) and base_outcome:
             ot_w_star[base_outcome] = 1.0
-
         otw_all.append(
             {"t": t, "w": token_at_t, "p_w": p_w_star, "dist": dict(ot_w_star)}
         )
 
-        # Alternate branches aggregated in LOG-SPACE
-        accounted = p_w_star
+        # Alternate branches (use log-space aggregation per branch)
         for br in entry.get("branches") or []:
             w_txt = br.get("token") or ""
             p_w = br.get("probability") or 0.0
-            accounted += p_w
-
-            # log-histogram over outcomes
             log_hist: Dict[str, float] = defaultdict(lambda: -math.inf)
             for sample in br.get("samples", []):
                 if sample.get("error"):
@@ -541,15 +538,12 @@ def build_outcome_distributions_exact(
                     and isinstance(lp_sum, (int, float))
                 ):
                     continue
-                # logaddexp accumulate: log_hist[o] = log( exp(log_hist[o]) + exp(lp_sum) )
                 prev = log_hist[outcome]
-                # numpy’s logaddexp is robust and already imported as np
                 log_hist[outcome] = float(np.logaddexp(prev, lp_sum))
-
-            dist_w = _normalize_from_log_hist(log_hist)  # stable branch normalization
+            dist_w = _normalize_from_log_hist(log_hist)
             otw_all.append({"t": t, "w": w_txt, "p_w": p_w, "dist": dist_w})
 
-        # Mix branches for o_t, then renormalize across outcomes (since we only keep top-k+w*)
+        # Mix branches then normalize across outcomes
         mix_raw: Dict[str, float] = defaultdict(float)
         for rec in otw_all:
             if rec["t"] != t:
@@ -569,9 +563,6 @@ def l2_distance(dist_a: Dict[str, float], dist_b: Dict[str, float]) -> float:
 
 
 def compute_drift_series_from_ot(ot_list: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """
-    y_t = d(o0, ot); expects ot_list[0] to be o0 ({'t': -1, 'token': '__o0__', 'dist': ...}).
-    """
     drift: List[Dict[str, Any]] = []
     if not ot_list:
         return drift
@@ -615,10 +606,6 @@ async def collect_base_path(
     completion_text_raw, completion_text = extract_choice_text(choice)
     token_entries = parse_logprob_entries(choice.get("logprobs"))
 
-    # NEW: store the completion text so we can use char offsets later
-    for entry in token_entries:
-        entry["completion_text_raw"] = completion_text_raw
-
     base_outcome = default_outcome_extractor(completion_text)
     is_correct = False
     if problem.get("gt_answer") and base_outcome and base_outcome != "__empty__":
@@ -633,7 +620,9 @@ async def collect_base_path(
     }
 
 
-def count_potential_forking_tokens(token_entries: List[Dict[str, Any]]) -> int:
+def count_potential_forking_tokens(
+    token_entries: List[Dict[str, Any]],
+) -> Tuple[int, int]:
     potential_forking_tokens = 0
     potential_forking_positions = 0
     for entry in token_entries:
@@ -657,24 +646,62 @@ def count_potential_forking_tokens(token_entries: List[Dict[str, Any]]) -> int:
     return potential_forking_tokens, potential_forking_positions
 
 
+def _existing_branch_map(entry: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    """Map token -> branch dict for quick lookup while resuming."""
+    out: Dict[str, Dict[str, Any]] = {}
+    for br in entry.get("branches", []) or []:
+        tok = br.get("token")
+        if isinstance(tok, str):
+            out[tok] = br
+    return out
+
+
+def _pending_samples_for_entry(entry: Dict[str, Any]) -> int:
+    """How many samples still needed for this entry (across all eligible alt tokens)."""
+    need = 0
+    existing = _existing_branch_map(entry)
+    for cand in entry.get("top_candidates", []) or []:
+        cand_raw = cand.get("token_raw")
+        cand_clean = cand.get("token")
+        cand_prob = cand.get("probability")
+        if (
+            (not cand_raw)
+            or (cand_raw == entry.get("token_raw"))
+            or (not is_safe_to_fork(cand_raw))
+        ):
+            continue
+        if (not isinstance(cand_prob, (int, float))) or (
+            cand_prob < args.alternate_min_prob
+        ):
+            continue
+        prev = existing.get(cand_clean, {})
+        have = len(prev.get("samples", []) or [])
+        if have < args.samples_per_fork:
+            need += args.samples_per_fork - have
+    return need
+
+
 async def sample_fork_branches(
     problem_idx: int,
     prompt: str,
     token_entries: List[Dict[str, Any]],
     *,
     semaphore: asyncio.Semaphore,
-    potential_forking_tokens: int,
+    base_completion_text_raw: str,
+    rollout_file: Path,
+    result_sink: Dict[str, Any],
 ) -> None:
-    pbar = tqdm(
-        total=potential_forking_tokens * args.samples_per_fork,
-        desc="Sampling alternative branches",
-    )
+    """Resume-aware branch sampler. Saves progress to rollout_file after each branch update."""
+    total_needed = sum(_pending_samples_for_entry(e) for e in token_entries)
+    pbar = tqdm(total=total_needed, desc="Sampling alternative branches (resumable)")
+
     for entry in token_entries:
-        branches: List[Dict[str, Any]] = []
-        entry["alt_candidates"] = []
-        for candidate in list(
-            entry.get("top_candidates", [])
-        ):  # iterate over a copy since we may remove
+        # Prepare existing branches dict for this entry (if any)
+        entry.setdefault("branches", [])
+        existing_map = _existing_branch_map(entry)
+        entry.setdefault("alt_candidates", [])
+
+        for candidate in list(entry.get("top_candidates", []) or []):
             cand_raw = candidate.get("token_raw")
             cand_clean = candidate.get("token")
             cand_prob = candidate.get("probability")
@@ -691,24 +718,30 @@ async def sample_fork_branches(
                 entry["top_candidates"].remove(candidate)
                 continue
 
-            # ===== KEY CHANGE: build fork prompt with char offsets + decoded token text =====
-            base_completion_text_raw: str = entry.get("completion_text_raw") or ""
+            # Build fork prompt with char offsets + decoded token text
             offset = entry.get("text_offset")
             if not isinstance(offset, int):
-                # Fallback: if offset missing, approximate with decoded prefix length of previous tokens
-                # (rare on Novita since text_offset is present)
                 offset = 0
             alt_text = detok_for_api(cand_raw)
             if alt_text is None:
-                raise RuntimeError(
-                    f"Failed to decode token {cand_raw!r} via tokenizer for model {args.model}"
-                )
+                # skip if can't decode safely
+                continue
             fork_prompt = f"{prompt}{base_completion_text_raw[:offset]}{alt_text}"
-
             # Compact entry
             candidate.pop("token_raw", None)
             candidate.pop("logprob", None)
             entry["alt_candidates"].append(candidate)
+            # Ensure branch container exists
+            branch = existing_map.get(cand_clean)
+            if branch is None:
+                branch = {"token": cand_clean, "probability": cand_prob, "samples": []}
+                entry["branches"].append(branch)
+                existing_map[cand_clean] = branch
+
+            have = len(branch.get("samples", []) or [])
+            need = max(0, args.samples_per_fork - have)
+            if need == 0:
+                continue
 
             tasks = [
                 make_api_request(
@@ -725,28 +758,30 @@ async def sample_fork_branches(
                     min_p=args.min_p,
                     top_k=args.top_k,
                 )
-                for _ in range(args.samples_per_fork)
+                for _ in range(need)
             ]
             responses = await asyncio.gather(*tasks, return_exceptions=True)
-            pbar.update(args.samples_per_fork)
 
-            for i in range(args.samples_per_fork):
-                generation_id = generate_timestamp_id()
-                if isinstance(responses[i], dict):
-                    record_generation(generation_id, str(problem_idx), responses[i])
+            # Record usage for each response
+            for res in responses:
+                gen_id = generate_timestamp_id()
+                if isinstance(res, dict):
+                    record_generation(gen_id, str(problem_idx), res)
 
-            samples: List[Dict[str, Any]] = []
-            for sample_idx, result in enumerate(responses):
+            for add_idx, result in enumerate(responses):
+                sample_idx = have + add_idx  # next index
                 if isinstance(result, Exception):
-                    samples.append({"sample_index": sample_idx, "error": str(result)})
+                    branch["samples"].append(
+                        {"sample_index": sample_idx, "error": str(result)}
+                    )
                     continue
                 if not isinstance(result, dict):
-                    samples.append(
+                    branch["samples"].append(
                         {"sample_index": sample_idx, "error": "Invalid response object"}
                     )
                     continue
                 if result.get("error"):
-                    samples.append(
+                    branch["samples"].append(
                         {
                             "sample_index": sample_idx,
                             "error": result.get("error"),
@@ -756,14 +791,13 @@ async def sample_fork_branches(
                     continue
                 sample_choices = result.get("choices") or []
                 if not sample_choices:
-                    samples.append(
+                    branch["samples"].append(
                         {"sample_index": sample_idx, "error": "No choices returned"}
                     )
                     continue
 
                 sample_choice = sample_choices[0]
                 sample_text_raw, sample_text = extract_choice_text(sample_choice)
-
                 logprob_sum = sum(
                     v
                     for v in (
@@ -777,7 +811,7 @@ async def sample_fork_branches(
                     else "Unknown"
                 )
                 outcome = default_outcome_extractor(sample_text)
-                samples.append(
+                branch["samples"].append(
                     {
                         "sample_index": sample_idx,
                         "final_answer_text": sample_text,
@@ -787,16 +821,20 @@ async def sample_fork_branches(
                     }
                 )
 
-            branches.append(
-                {"token": cand_clean, "probability": cand_prob, "samples": samples}
-            )
-            entry["branches"] = branches
+            # After each branch update, persist progress
+            result_sink["token_steps"] = token_entries
+            result_sink["status"] = "fork_sampling_in_progress"
+            safe_write_json(rollout_file, result_sink)
 
-        # tidy
-        entry.pop("top_candidates", None)
+            pbar.update(need)
+
+        if entry["branches"] == []:
+            entry.pop("branches", None)
+        # for entry in token_entries:
         entry.pop("token_raw", None)
         entry.pop("logprob", None)
-        entry.pop("completion_text_raw", None)
+        entry.pop("top_candidates", None)
+
     pbar.close()
 
 
@@ -807,17 +845,13 @@ async def sample_o0_distribution(
     semaphore: asyncio.Semaphore,
     samples: int,
 ) -> Dict[str, float]:
-    """
-    o0 = resample from t=0 (no forced tokens), aggregate outcomes into a histogram.
-    Equal-weight Monte Carlo estimate (paper baseline (1)).
-    """
     tasks = [
         make_api_request(
             prompt,
-            temperature=args.temperature,  # match continuation sampling
+            temperature=args.temperature,
             top_p=args.top_p,
             max_tokens=args.continuation_max_tokens,
-            logprobs=False,  # not needed to weight o0
+            logprobs=False,
             semaphore=semaphore,
             frequency_penalty=args.frequency_penalty,
             presence_penalty=args.presence_penalty,
@@ -829,7 +863,6 @@ async def sample_o0_distribution(
     ]
     responses = await asyncio.gather(*tasks, return_exceptions=True)
 
-    # record usage (optional)
     for r in responses:
         gen_id = generate_timestamp_id()
         if isinstance(r, dict):
@@ -852,62 +885,23 @@ async def sample_o0_distribution(
     if valid == 0:
         return {"__empty__": 1.0}
 
-    # equal-weight normalization
     return {k: v / float(valid) for k, v in counts.items()}
 
 
-async def generate_rollout(
-    problem_idx: int, problem: Dict[str, Any], *, semaphore: asyncio.Semaphore
+async def generate_rollout_resume(
+    problem_idx: int,
+    problem: Dict[str, Any],
+    *,
+    semaphore: asyncio.Semaphore,
+    rollout_file: Path,
+    existing: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    prompt = (
-        "Solve this math problem step by step. You MUST put your final answer in \\boxed{}."
-        " Problem: "
-        f"{problem['problem']} Solution: \n<think>\n"
-    )
-    base_data = await collect_base_path(
-        problem, problem_idx, prompt, semaphore=semaphore
-    )
-    if base_data.get("error"):
-        return {
-            "problem_index": problem_idx,
-            "error": base_data.get("error"),
-            "details": base_data.get("details"),
-        }
-
-    token_entries = base_data.get("token_entries", [])
-    potential_forking_tokens, potential_forking_positions = (
-        count_potential_forking_tokens(token_entries)
-    )
-    print(
-        "\n\nPotential forking positions:",
-        potential_forking_positions,
-        "\nPotential forking tokens:",
-        potential_forking_tokens,
-        "\n",
-    )
-    await sample_fork_branches(
-        problem_idx,
-        prompt,
-        token_entries,
-        semaphore=semaphore,
-        potential_forking_tokens=potential_forking_tokens,
-    )
-
-    o0_dist = await sample_o0_distribution(
-        problem_idx, prompt, semaphore=semaphore, samples=args.samples_per_fork
-    )
-    print(o0_dist)
-
-    ot_list, otw_list = build_outcome_distributions_exact(
-        base_data.get("base_outcome", "__empty__"),
-        token_entries,
-        o0_dist=o0_dist,
-    )
-    drift_series = compute_drift_series_from_ot(ot_list)
-
-    return {
-        "problem_index": problem_idx,
-        "metadata": {
+    # Initialize / load result skeleton
+    result: Dict[str, Any] = existing or {}
+    result.setdefault("problem_index", problem_idx)
+    result.setdefault(
+        "metadata",
+        {
             "model": args.model,
             "base_temperature": args.base_temperature,
             "sample_temperature": args.temperature,
@@ -918,28 +912,104 @@ async def generate_rollout(
             "alternate_top_k": args.alternate_top_k,
             "alternate_min_prob": args.alternate_min_prob,
         },
-        "prompt": prompt,
-        "problem": {
+    )
+    result.setdefault(
+        "problem",
+        {
             "problem_text": problem.get("problem"),
             "level": problem.get("level"),
             "type": problem.get("type"),
             "gt_answer": problem.get("gt_answer"),
         },
-        "base": {
+    )
+
+    prompt = result.get("prompt")
+    if not isinstance(prompt, str):
+        prompt = (
+            "Solve this math problem step by step. You MUST put your final answer in \\boxed{}."
+            " Problem: "
+            f"{problem['problem']} Solution: \n<think>\n"
+        )
+        result["prompt"] = prompt
+        safe_write_json(rollout_file, result)
+
+    # 1) Base path (if missing)
+    if "base" not in result or "token_steps" not in result:
+        base_data = await collect_base_path(
+            problem, problem_idx, prompt, semaphore=semaphore
+        )
+        if base_data.get("error"):
+            return {
+                "problem_index": problem_idx,
+                "error": base_data.get("error"),
+                "details": base_data.get("details"),
+            }
+        result["base"] = {
             "completion": base_data.get("completion_text"),
             "completion_raw": base_data.get("completion_text_raw"),
             "outcome": base_data.get("base_outcome"),
             "is_correct": base_data.get("base_is_correct"),
-        },
-        "token_steps": token_entries,  # unchanged; contains raw sampling details
-        # --- MINIMAL saving here ---
-        "outcome_distributions": {
-            "o0": o0_dist,  # { outcome: prob }
-            "ot": ot_list,  # [{ "t": int, "token": str, "dist": { outcome: prob } }, ...]
-            "otw": otw_list,  # [{ "t": int, "w": str, "p_w": float, "dist": { outcome: prob } }, ...]
-        },
-        "drift_series": drift_series,  # [{ "t": int, "drift": float }, ...]
-    }
+        }
+        result["token_steps"] = base_data.get("token_entries", [])
+        result["status"] = "base_collected"
+        safe_write_json(rollout_file, result)
+
+    token_entries = result.get("token_steps", [])
+    base_completion_text_raw: str = result.get("base", {}).get("completion_raw") or ""
+
+    # 2) Fork sampling (resume-aware)
+    # Check if we still need any samples
+    remaining = sum(_pending_samples_for_entry(e) for e in token_entries)
+    if remaining > 0:
+        await sample_fork_branches(
+            problem_idx,
+            prompt,
+            token_entries,
+            semaphore=semaphore,
+            base_completion_text_raw=base_completion_text_raw,
+            rollout_file=rollout_file,
+            result_sink=result,
+        )
+        result["token_steps"] = token_entries
+        result["status"] = "fork_sampling_done"
+        safe_write_json(rollout_file, result)
+
+    # 3) o0 (baseline) if missing
+    outcome_distributions = result.setdefault("outcome_distributions", {})
+    if "o0" not in outcome_distributions:
+        o0_dist = await sample_o0_distribution(
+            problem_idx, prompt, semaphore=semaphore, samples=args.samples_per_fork
+        )
+        outcome_distributions["o0"] = o0_dist
+        result["outcome_distributions"] = outcome_distributions
+        result["status"] = "o0_sampled"
+        safe_write_json(rollout_file, result)
+    else:
+        o0_dist = outcome_distributions["o0"]
+
+    # 4) Build ot / otw if missing
+    if ("ot" not in outcome_distributions) or ("otw" not in outcome_distributions):
+        ot_list, otw_list = build_outcome_distributions_exact(
+            result.get("base", {}).get("outcome", "__empty__"),
+            token_entries,
+            o0_dist=o0_dist,
+        )
+        outcome_distributions["ot"] = ot_list
+        outcome_distributions["otw"] = otw_list
+        result["outcome_distributions"] = outcome_distributions
+        result["status"] = "ot_built"
+        safe_write_json(rollout_file, result)
+
+    # 5) Drift series if missing
+    if "drift_series" not in result:
+        drift_series = compute_drift_series_from_ot(
+            result["outcome_distributions"]["ot"]
+        )
+        result["drift_series"] = drift_series
+        result["status"] = "done"
+        safe_write_json(rollout_file, result)
+
+    return result
 
 
 async def process_problem(
@@ -951,19 +1021,33 @@ async def process_problem(
     if not problem_file.exists() or args.force:
         with open(problem_file, "w", encoding="utf-8") as f:
             json.dump(problem, f, indent=2, ensure_ascii=False)
+
     rollout_file = problem_dir / "rollout_analysis.json"
     error_file = problem_dir / "rollout_error.json"
+
+    # NEW: resume from file if it exists (unless --force)
+    existing = None
     if rollout_file.exists() and not args.force:
-        return
-    result = await generate_rollout(problem_idx, problem, semaphore=semaphore)
+        existing = load_json_if_exists(rollout_file)
+        if existing:
+            print(
+                f"[Resume] Found checkpoint for problem {problem_idx} with status={existing.get('status')}."
+            )
+
+    result = await generate_rollout_resume(
+        problem_idx,
+        problem,
+        semaphore=REQUEST_SEMAPHORE,
+        rollout_file=rollout_file,
+        existing=existing,
+    )
+
     if result.get("error"):
         with open(error_file, "w", encoding="utf-8") as f:
             json.dump(result, f, indent=2, ensure_ascii=False)
         return
     if error_file.exists():
         error_file.unlink()
-    with open(rollout_file, "w", encoding="utf-8") as f:
-        json.dump(result, f, indent=2, ensure_ascii=False)
 
 
 async def main() -> None:
