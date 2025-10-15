@@ -492,6 +492,21 @@ def _weighted_add(dst: Dict[str, float], src: Dict[str, float], weight: float) -
         dst[k] = dst.get(k, 0.0) + weight * v
 
 
+def _empirical_outcome_dist(samples: List[Dict[str, Any]]) -> Dict[str, float]:
+    counts: Dict[str, int] = defaultdict(int)
+    total = 0
+    for s in samples or []:
+        if s.get("error"):
+            continue
+        o = s.get("outcome")
+        if isinstance(o, str) and o:
+            counts[o] += 1
+            total += 1
+    if total == 0:
+        return {}
+    return {k: v / float(total) for k, v in counts.items()}
+
+
 def build_outcome_distributions_exact(
     base_outcome: str,
     token_entries: List[Dict[str, Any]],
@@ -499,9 +514,10 @@ def build_outcome_distributions_exact(
     o0_dist: Optional[Dict[str, float]] = None,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """
-    Returns:
-      ot_list  : [{ "t": int, "token": str, "dist": { outcome: prob } }, ...] (o0 at t=-1 if provided)
-      otw_list : [{ "t": int, "w": str, "p_w": float, "dist": { outcome: prob } }, ...]
+    Paper-conformant construction:
+      • For each (t,w): o_{t,w} is the empirical outcome histogram over S samples (equal weights).
+      • Mix across tokens: o_t ∝ Σ_w p(w|prefix) · o_{t,w}, renormalize over outcomes.
+      • Include o0 (t = -1) if provided.
     """
     ot_list: List[Dict[str, Any]] = []
     otw_all: List[Dict[str, Any]] = []
@@ -514,36 +530,27 @@ def build_outcome_distributions_exact(
         token_at_t = entry.get("token") or ""
         p_w_star = entry.get("probability") or 0.0
 
-        # Greedy branch = delta on base outcome
-        ot_w_star = {}
-        if isinstance(base_outcome, str) and base_outcome:
-            ot_w_star[base_outcome] = 1.0
-        otw_all.append(
-            {"t": t, "w": token_at_t, "p_w": p_w_star, "dist": dict(ot_w_star)}
-        )
+        # Build a map of existing branches for this t (should include greedy after Patch 2)
+        branch_map = {br.get("token"): br for br in (entry.get("branches") or [])}
 
-        # Alternate branches (use log-space aggregation per branch)
-        for br in entry.get("branches") or []:
-            w_txt = br.get("token") or ""
+        # --- Greedy branch o_{t,w*} from samples if present, else fallback to delta on base_outcome ---
+        greedy_branch = branch_map.get(token_at_t)
+        if greedy_branch and (greedy_branch.get("samples")):
+            dist_w_star = _empirical_outcome_dist(greedy_branch.get("samples"))
+        else:
+            # Fallback (should be rare if Patch 2 runs): delta at base outcome
+            dist_w_star = {base_outcome: 1.0} if base_outcome else {}
+        otw_all.append({"t": t, "w": token_at_t, "p_w": p_w_star, "dist": dist_w_star})
+
+        # --- Alternate branches: empirical outcome frequencies ---
+        for br_tok, br in branch_map.items():
+            if br_tok == token_at_t:
+                continue
             p_w = br.get("probability") or 0.0
-            log_hist: Dict[str, float] = defaultdict(lambda: -math.inf)
-            for sample in br.get("samples", []):
-                if sample.get("error"):
-                    continue
-                outcome = sample.get("outcome")
-                lp_sum = sample.get("logprob_sum")
-                if not (
-                    isinstance(outcome, str)
-                    and outcome
-                    and isinstance(lp_sum, (int, float))
-                ):
-                    continue
-                prev = log_hist[outcome]
-                log_hist[outcome] = float(np.logaddexp(prev, lp_sum))
-            dist_w = _normalize_from_log_hist(log_hist)
-            otw_all.append({"t": t, "w": w_txt, "p_w": p_w, "dist": dist_w})
+            dist_w = _empirical_outcome_dist(br.get("samples"))
+            otw_all.append({"t": t, "w": br_tok, "p_w": p_w, "dist": dist_w})
 
-        # Mix branches then normalize across outcomes
+        # --- Mix across tokens for this t, then renormalize over outcomes ---
         mix_raw: Dict[str, float] = defaultdict(float)
         for rec in otw_all:
             if rec["t"] != t:
@@ -701,6 +708,8 @@ async def sample_fork_branches(
         existing_map = _existing_branch_map(entry)
         entry.setdefault("alt_candidates", [])
 
+        # ---------- sample alternate token branches w != w* ----------
+        alt_tokens_at_this_position = False
         for candidate in list(entry.get("top_candidates", []) or []):
             cand_raw = candidate.get("token_raw")
             cand_clean = candidate.get("token")
@@ -717,7 +726,7 @@ async def sample_fork_branches(
             ):
                 entry["top_candidates"].remove(candidate)
                 continue
-
+            alt_tokens_at_this_position = True
             # Build fork prompt with char offsets + decoded token text
             offset = entry.get("text_offset")
             if not isinstance(offset, int):
@@ -827,6 +836,127 @@ async def sample_fork_branches(
             safe_write_json(rollout_file, result_sink)
 
             pbar.update(need)
+        # ---------- sample greedy token branch w* ----------
+        if alt_tokens_at_this_position:
+            w_star_raw = entry.get("token_raw")
+            w_star_clean = entry.get("token")
+            p_w_star = entry.get("probability") or 0.0
+            offset = entry.get("text_offset")
+            if not isinstance(offset, int):
+                offset = 0
+            w_star_text = (
+                detok_for_api(w_star_raw) if isinstance(w_star_raw, str) else None
+            )
+            if w_star_text:
+                fork_prompt_w_star = (
+                    f"{prompt}{base_completion_text_raw[:offset]}{w_star_text}"
+                )
+
+                # ensure a branch object exists for the greedy token
+                entry.setdefault("branches", [])
+                existing_map = _existing_branch_map(entry)
+                branch_star = existing_map.get(w_star_clean)
+                if branch_star is None:
+                    branch_star = {
+                        "token": w_star_clean,
+                        "probability": p_w_star,
+                        "samples": [],
+                    }
+                    entry["branches"].append(branch_star)
+                    existing_map[w_star_clean] = branch_star
+
+                have = len(branch_star.get("samples", []) or [])
+                need = max(0, args.samples_per_fork - have)
+                if need > 0:
+                    tasks = [
+                        make_api_request(
+                            fork_prompt_w_star,
+                            temperature=args.temperature,
+                            top_p=args.top_p,
+                            max_tokens=args.continuation_max_tokens,
+                            top_logprobs=args.continuation_top_logprobs,
+                            logprobs=True,
+                            semaphore=semaphore,
+                            frequency_penalty=args.frequency_penalty,
+                            presence_penalty=args.presence_penalty,
+                            repetition_penalty=args.repetition_penalty,
+                            min_p=args.min_p,
+                            top_k=args.top_k,
+                        )
+                        for _ in range(need)
+                    ]
+                    responses = await asyncio.gather(*tasks, return_exceptions=True)
+
+                    for res in responses:
+                        gen_id = generate_timestamp_id()
+                        if isinstance(res, dict):
+                            record_generation(gen_id, str(problem_idx), res)
+
+                    for add_idx, result in enumerate(responses):
+                        sample_idx = have + add_idx
+                        if isinstance(result, Exception):
+                            branch_star["samples"].append(
+                                {"sample_index": sample_idx, "error": str(result)}
+                            )
+                            continue
+                        if not isinstance(result, dict):
+                            branch_star["samples"].append(
+                                {
+                                    "sample_index": sample_idx,
+                                    "error": "Invalid response object",
+                                }
+                            )
+                            continue
+                        if result.get("error"):
+                            branch_star["samples"].append(
+                                {
+                                    "sample_index": sample_idx,
+                                    "error": result.get("error"),
+                                    "details": result.get("details"),
+                                }
+                            )
+                            continue
+                        sample_choices = result.get("choices") or []
+                        if not sample_choices:
+                            branch_star["samples"].append(
+                                {
+                                    "sample_index": sample_idx,
+                                    "error": "No choices returned",
+                                }
+                            )
+                            continue
+
+                        sample_choice = sample_choices[0]
+                        _, sample_text = extract_choice_text(sample_choice)
+                        logprob_sum = sum(
+                            v
+                            for v in (
+                                sample_choice.get("logprobs", {}).get("token_logprobs")
+                                or []
+                            )
+                            if isinstance(v, (int, float))
+                        )
+                        continuation_probability = (
+                            math.exp(logprob_sum)
+                            if sample_choice.get("logprobs")
+                            else "Unknown"
+                        )
+                        outcome = default_outcome_extractor(sample_text)
+                        branch_star["samples"].append(
+                            {
+                                "sample_index": sample_idx,
+                                "final_answer_text": sample_text,
+                                "logprob_sum": logprob_sum,
+                                "continuation_probability": continuation_probability,
+                                "outcome": outcome,
+                            }
+                        )
+
+                    # persist after greedy branch update
+                    result_sink["token_steps"] = token_entries
+                    result_sink["status"] = "fork_sampling_in_progress"
+                    safe_write_json(rollout_file, result_sink)
+                    pbar.update(need)
 
         if entry["branches"] == []:
             entry.pop("branches", None)

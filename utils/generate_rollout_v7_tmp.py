@@ -1,4 +1,4 @@
-# generate_rollout.py — progressive saves + resume from checkpoint
+# generate_rollout.py — progressive saves + resume from checkpoint + usage/cost estimate + live accounting
 
 import os
 import sys
@@ -28,7 +28,7 @@ from utils.utils import (
 load_dotenv()
 
 NOVITA_API_URL = "https://api.novita.ai/openai/v1/completions"
-NOVITA_API_KEY = os.getenv("NOVITA_API_KEY")
+NOVITA_API_KEY = os.getenv("NOVITA_API_KEY_SPAR")
 if not NOVITA_API_KEY:
     raise RuntimeError(
         "NOVITA_API_KEY is not set. Please define it in the environment or .env file."
@@ -40,7 +40,7 @@ USAGE_FILENAME = "usage.json"
 import argparse
 
 parser = argparse.ArgumentParser(
-    description="Collect forked rollouts with outcome distributions and drift analysis (progressive + resumable)."
+    description="Collect forked rollouts with outcome distributions and drift analysis (progressive + resumable + usage/cost accounting)."
 )
 parser.add_argument(
     "-m",
@@ -97,14 +97,13 @@ np.random.seed(args.seed)
 
 REQUEST_SEMAPHORE: Optional[asyncio.Semaphore] = None
 
-# ---------------- NEW: tokenizer cache & helpers ----------------
+# ---------------- tokenizer cache & helpers ----------------
 
 _TOKENIZER_CACHE: Dict[str, Any] = {}
 
 
 def _guess_hf_tokenizer_name(model_name: str) -> str:
     name = model_name.lower()
-    # Map DeepSeek R1 variants to the tokenizer they advertise
     if "qwen" in name:
         return "deepseek-ai/DeepSeek-R1-Distill-Qwen-14B"
     elif "llama" in name:
@@ -122,30 +121,92 @@ def get_tokenizer(model_name: str):
     return tok
 
 
+def count_tokens(text: str) -> int:
+    tok = get_tokenizer(args.model)
+    # robust for long text; returns number of input_ids
+    return len(tok.encode(text, add_special_tokens=False))
+
+
 def detok_for_api(token_str: str) -> Optional[str]:
-    """
-    Convert a *token string* (e.g., 'ĠNow', '.ĊĊ', '▁The') into true text
-    using the model's tokenizer. This avoids feeding display markers (Ġ/Ċ/▁) into the prompt.
-    """
     if not isinstance(token_str, str) or token_str == "":
         return None
     tok = get_tokenizer(args.model)
     tid = tok.convert_tokens_to_ids(token_str)
     if isinstance(tid, int) and tid >= 0 and tid != tok.unk_token_id:
-        text = tok.decode([tid], clean_up_tokenization_spaces=False)
-        return text
-    else:
-        return None
+        return tok.decode([tid], clean_up_tokenization_spaces=False)
+    return None
+
+
+# ---------------- pricing & usage helpers ----------------
+
+# Per your instruction: DeepSeek R1 Distill Qwen 14B on Novita → $0.15 / 1M for both input and output.
+PRICES_PER_MTOK = {
+    "deepseek/deepseek-r1-distill-qwen-14b": {"input": 0.15, "output": 0.15},
+}
+DEFAULT_PRICE = {"input": 0.15, "output": 0.15}
+
+
+def _prices_for_model(model: str) -> Dict[str, float]:
+    return PRICES_PER_MTOK.get(model, DEFAULT_PRICE)
+
+
+def _cost_usd(input_tokens: int, output_tokens: int) -> float:
+    p = _prices_for_model(args.model)
+    return (input_tokens * p["input"] + output_tokens * p["output"]) / 1_000_000.0
+
+
+def _init_usage_actual(result: Dict[str, Any]) -> None:
+    result.setdefault(
+        "usage_actual", {"input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0}
+    )
+
+
+def _bump_usage(
+    result: Dict[str, Any],
+    in_add: int,
+    out_add: int,
+    rollout_file: Optional[Path] = None,
+):
+    _init_usage_actual(result)
+    ua = result["usage_actual"]
+    ua["input_tokens"] = int(ua.get("input_tokens", 0)) + int(max(0, in_add))
+    ua["output_tokens"] = int(ua.get("output_tokens", 0)) + int(max(0, out_add))
+    ua["cost_usd"] = float(_cost_usd(ua["input_tokens"], ua["output_tokens"]))
+    if rollout_file is not None:
+        safe_write_json(rollout_file, result)
+
+
+def _usage_from_response(resp: Dict[str, Any]) -> Tuple[int, int]:
+    """Returns (prompt_tokens, completion_tokens) or (0,0) if unavailable."""
+    if not isinstance(resp, dict):
+        return (0, 0)
+    u = resp.get("usage") or {}
+    pin = u.get("prompt_tokens") or 0
+    pout = u.get("completion_tokens") or 0
+    if not isinstance(pin, int):
+        pin = 0
+    if not isinstance(pout, int):
+        pout = 0
+    return (pin, pout)
+
+
+def _apply_usage_from_responses(
+    result: Dict[str, Any], responses: List[Any], rollout_file: Optional[Path] = None
+):
+    in_sum = out_sum = 0
+    for r in responses:
+        if isinstance(r, dict):
+            pin, pout = _usage_from_response(r)
+            in_sum += pin
+            out_sum += pout
+    if in_sum or out_sum:
+        _bump_usage(result, in_sum, out_sum, rollout_file)
 
 
 # ---------------- utility & API ----------------
 
 
 def safe_write_json(path: Path, data: Dict[str, Any]) -> None:
-    """
-    Atomic-ish write: dump to a temp file and replace the target.
-    On POSIX, replace/rename updates the path in one step so readers see old or new.
-    """
     tmp = path.with_suffix(path.suffix + ".tmp")
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
@@ -168,24 +229,28 @@ def record_generation(
     base_dir = Path(__file__).resolve().parents[1]
     generations_dir = base_dir / GENERATIONS_DIRNAME
     generations_dir.mkdir(parents=True, exist_ok=True)
-
     generations_path = generations_dir / GENERATIONS_REGISTRY
-    generations_entry = {
-        "generation_id": generation_id,
-        "model_name": args.model,
-        "problem_id": problem_id,
-    }
-    append_to_json_array(generations_path, generations_entry)
-
+    append_to_json_array(
+        generations_path,
+        {
+            "generation_id": generation_id,
+            "model_name": args.model,
+            "problem_id": problem_id,
+        },
+    )
     usage_path = generations_dir / USAGE_FILENAME
-    usage_entry = {
-        "generation_id": generation_id,
-        "prompt_tokens": response_json.get("usage", {}).get("prompt_tokens"),
-        "completion_tokens": response_json.get("usage", {}).get("completion_tokens"),
-        "total_tokens": response_json.get("usage", {}).get("total_tokens"),
-        "api_key": "novita",
-    }
-    append_to_json_array(usage_path, usage_entry)
+    append_to_json_array(
+        usage_path,
+        {
+            "generation_id": generation_id,
+            "prompt_tokens": response_json.get("usage", {}).get("prompt_tokens"),
+            "completion_tokens": response_json.get("usage", {}).get(
+                "completion_tokens"
+            ),
+            "total_tokens": response_json.get("usage", {}).get("total_tokens"),
+            "api_key": "novita",
+        },
+    )
 
 
 def build_headers() -> Dict[str, str]:
@@ -264,7 +329,7 @@ async def make_api_request(
     return {"error": "All API request attempts failed"}
 
 
-# --- display cleaner (unchanged) ---
+# --- cleaners (unchanged) ---
 def _clean_token_display(s: object) -> str:
     text = s if isinstance(s, str) else str(s)
     if not text:
@@ -305,8 +370,7 @@ def is_safe_to_fork(token_str: str) -> bool:
 def extract_choice_text(choice: Dict[str, Any]) -> Tuple[str, str]:
     text_raw = choice.get("text")
     if isinstance(text_raw, str):
-        text = _clean_token_display(text_raw)
-        return text_raw, text
+        return text_raw, _clean_token_display(text_raw)
     message = choice.get("message")
     if isinstance(message, dict):
         content = message.get("content")
@@ -498,11 +562,6 @@ def build_outcome_distributions_exact(
     *,
     o0_dist: Optional[Dict[str, float]] = None,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    """
-    Returns:
-      ot_list  : [{ "t": int, "token": str, "dist": { outcome: prob } }, ...] (o0 at t=-1 if provided)
-      otw_list : [{ "t": int, "w": str, "p_w": float, "dist": { outcome: prob } }, ...]
-    """
     ot_list: List[Dict[str, Any]] = []
     otw_all: List[Dict[str, Any]] = []
 
@@ -522,7 +581,7 @@ def build_outcome_distributions_exact(
             {"t": t, "w": token_at_t, "p_w": p_w_star, "dist": dict(ot_w_star)}
         )
 
-        # Alternate branches (use log-space aggregation per branch)
+        # Alternate branches (log-space aggregation)
         for br in entry.get("branches") or []:
             w_txt = br.get("token") or ""
             p_w = br.get("probability") or 0.0
@@ -543,7 +602,6 @@ def build_outcome_distributions_exact(
             dist_w = _normalize_from_log_hist(log_hist)
             otw_all.append({"t": t, "w": w_txt, "p_w": p_w, "dist": dist_w})
 
-        # Mix branches then normalize across outcomes
         mix_raw: Dict[str, float] = defaultdict(float)
         for rec in otw_all:
             if rec["t"] != t:
@@ -572,6 +630,59 @@ def compute_drift_series_from_ot(ot_list: List[Dict[str, Any]]) -> List[Dict[str
         ot = rec.get("dist", {}) or {}
         drift.append({"t": t, "drift": l2_distance(o0, ot)})
     return drift
+
+
+# ---------- cost/usage estimation ----------
+def estimate_total_usage(
+    prompt: str,
+    token_entries: List[Dict[str, Any]],
+    potential_forking_tokens: int,
+    samples_per_fork: int,
+) -> Dict[str, Any]:
+    """
+    Assumptions (per your request):
+      • Fork tokens are uniformly distributed over indices of the greedy completion.
+      • Every sampled completion (base/alt/o0) has the same output length as the greedy completion.
+    """
+    prompt_tok = count_tokens(prompt)
+    T = len(token_entries)  # greedy completion length in tokens
+
+    # Base path (1 call)
+    base_in = prompt_tok
+    base_out = T
+
+    # Forked continuations
+    # Avg prefix length under uniform token index ≈ T/2; +1 for the alternate token itself.
+    avg_prefix = int(round(T / 2))
+    per_fork_in = prompt_tok + avg_prefix + 1
+    per_fork_out = T
+    forks_in = potential_forking_tokens * samples_per_fork * per_fork_in
+    forks_out = potential_forking_tokens * samples_per_fork * per_fork_out
+
+    # o0 resampling (samples_per_fork calls), no forced prefix
+    o0_in = samples_per_fork * prompt_tok
+    o0_out = samples_per_fork * T
+
+    est_in = base_in + forks_in + o0_in
+    est_out = base_out + forks_out + o0_out
+
+    return {
+        "input_tokens": int(est_in),
+        "output_tokens": int(est_out),
+        "cost_usd": float(_cost_usd(est_in, est_out)),
+        "assumptions": {
+            "uniform_fork_positions": True,
+            "completion_len_equals_greedy_T": T,
+            "avg_prefix_tokens": avg_prefix,
+            "per_fork_samples": samples_per_fork,
+            "potential_forking_tokens": potential_forking_tokens,
+            "prompt_tokens": prompt_tok,
+        },
+        "unit_prices_per_mtoken": _prices_for_model(args.model),
+    }
+
+
+# ---------- main pipeline ----------
 
 
 async def collect_base_path(
@@ -616,7 +727,7 @@ async def collect_base_path(
         "token_entries": token_entries,
         "base_outcome": base_outcome,
         "base_is_correct": is_correct,
-        "raw_response": response,
+        "raw_response": response,  # keep for usage
     }
 
 
@@ -627,16 +738,15 @@ def count_potential_forking_tokens(
     potential_forking_positions = 0
     for entry in token_entries:
         current_position_forking = False
-        for candidate in entry.get("top_candidates", []):
+        for candidate in entry.get("top_candidates", []) or []:
             candidate_token = candidate.get("token_raw")
             candidate_probability = candidate.get("probability")
             if (not candidate_token) or (candidate_token == entry.get("token_raw")):
                 continue
             if not is_safe_to_fork(candidate_token):
                 continue
-            if (
-                not isinstance(candidate_probability, (int, float))
-                or candidate_probability < args.alternate_min_prob
+            if (not isinstance(candidate_probability, (int, float))) or (
+                candidate_probability < args.alternate_min_prob
             ):
                 continue
             potential_forking_tokens += 1
@@ -647,7 +757,6 @@ def count_potential_forking_tokens(
 
 
 def _existing_branch_map(entry: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
-    """Map token -> branch dict for quick lookup while resuming."""
     out: Dict[str, Dict[str, Any]] = {}
     for br in entry.get("branches", []) or []:
         tok = br.get("token")
@@ -657,7 +766,6 @@ def _existing_branch_map(entry: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
 
 
 def _pending_samples_for_entry(entry: Dict[str, Any]) -> int:
-    """How many samples still needed for this entry (across all eligible alt tokens)."""
     need = 0
     existing = _existing_branch_map(entry)
     for cand in entry.get("top_candidates", []) or []:
@@ -691,12 +799,10 @@ async def sample_fork_branches(
     rollout_file: Path,
     result_sink: Dict[str, Any],
 ) -> None:
-    """Resume-aware branch sampler. Saves progress to rollout_file after each branch update."""
     total_needed = sum(_pending_samples_for_entry(e) for e in token_entries)
     pbar = tqdm(total=total_needed, desc="Sampling alternative branches (resumable)")
 
     for entry in token_entries:
-        # Prepare existing branches dict for this entry (if any)
         entry.setdefault("branches", [])
         existing_map = _existing_branch_map(entry)
         entry.setdefault("alt_candidates", [])
@@ -718,20 +824,18 @@ async def sample_fork_branches(
                 entry["top_candidates"].remove(candidate)
                 continue
 
-            # Build fork prompt with char offsets + decoded token text
             offset = entry.get("text_offset")
             if not isinstance(offset, int):
                 offset = 0
             alt_text = detok_for_api(cand_raw)
             if alt_text is None:
-                # skip if can't decode safely
                 continue
             fork_prompt = f"{prompt}{base_completion_text_raw[:offset]}{alt_text}"
-            # Compact entry
+
             candidate.pop("token_raw", None)
             candidate.pop("logprob", None)
             entry["alt_candidates"].append(candidate)
-            # Ensure branch container exists
+
             branch = existing_map.get(cand_clean)
             if branch is None:
                 branch = {"token": cand_clean, "probability": cand_prob, "samples": []}
@@ -762,14 +866,15 @@ async def sample_fork_branches(
             ]
             responses = await asyncio.gather(*tasks, return_exceptions=True)
 
-            # Record usage for each response
+            # Record & accumulate usage
             for res in responses:
                 gen_id = generate_timestamp_id()
                 if isinstance(res, dict):
                     record_generation(gen_id, str(problem_idx), res)
+            _apply_usage_from_responses(result_sink, responses, rollout_file)
 
             for add_idx, result in enumerate(responses):
-                sample_idx = have + add_idx  # next index
+                sample_idx = have + add_idx
                 if isinstance(result, Exception):
                     branch["samples"].append(
                         {"sample_index": sample_idx, "error": str(result)}
@@ -821,16 +926,14 @@ async def sample_fork_branches(
                     }
                 )
 
-            # After each branch update, persist progress
+            # persist progress after each branch
             result_sink["token_steps"] = token_entries
             result_sink["status"] = "fork_sampling_in_progress"
             safe_write_json(rollout_file, result_sink)
-
             pbar.update(need)
 
-        if entry["branches"] == []:
+        if entry.get("branches") == []:
             entry.pop("branches", None)
-        # for entry in token_entries:
         entry.pop("token_raw", None)
         entry.pop("logprob", None)
         entry.pop("top_candidates", None)
@@ -839,12 +942,8 @@ async def sample_fork_branches(
 
 
 async def sample_o0_distribution(
-    problem_idx: int,
-    prompt: str,
-    *,
-    semaphore: asyncio.Semaphore,
-    samples: int,
-) -> Dict[str, float]:
+    problem_idx: int, prompt: str, *, semaphore: asyncio.Semaphore, samples: int
+) -> Tuple[Dict[str, float], Dict[str, int]]:
     tasks = [
         make_api_request(
             prompt,
@@ -863,10 +962,15 @@ async def sample_o0_distribution(
     ]
     responses = await asyncio.gather(*tasks, return_exceptions=True)
 
+    # record + usage
+    in_sum = out_sum = 0
     for r in responses:
         gen_id = generate_timestamp_id()
         if isinstance(r, dict):
             record_generation(gen_id, str(problem_idx), r)
+            pi, po = _usage_from_response(r)
+            in_sum += pi
+            out_sum += po
 
     counts: Dict[str, int] = defaultdict(int)
     valid = 0
@@ -881,11 +985,11 @@ async def sample_o0_distribution(
         if isinstance(outcome, str) and outcome:
             counts[outcome] += 1
             valid += 1
-
     if valid == 0:
-        return {}
+        return {}, {"input_tokens": in_sum, "output_tokens": out_sum}
 
-    return {k: v / float(valid) for k, v in counts.items()}
+    o0 = {k: v / float(valid) for k, v in counts.items()}
+    return o0, {"input_tokens": in_sum, "output_tokens": out_sum}
 
 
 async def generate_rollout_resume(
@@ -896,7 +1000,6 @@ async def generate_rollout_resume(
     rollout_file: Path,
     existing: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    # Initialize / load result skeleton
     result: Dict[str, Any] = existing or {}
     result.setdefault("problem_index", problem_idx)
     result.setdefault(
@@ -922,6 +1025,7 @@ async def generate_rollout_resume(
             "gt_answer": problem.get("gt_answer"),
         },
     )
+    _init_usage_actual(result)
 
     prompt = result.get("prompt")
     if not isinstance(prompt, str):
@@ -944,6 +1048,10 @@ async def generate_rollout_resume(
                 "error": base_data.get("error"),
                 "details": base_data.get("details"),
             }
+        # usage from base call
+        pin, pout = _usage_from_response(base_data.get("raw_response", {}))
+        _bump_usage(result, pin, pout, rollout_file)
+
         result["base"] = {
             "completion": base_data.get("completion_text"),
             "completion_raw": base_data.get("completion_text_raw"),
@@ -957,8 +1065,24 @@ async def generate_rollout_resume(
     token_entries = result.get("token_steps", [])
     base_completion_text_raw: str = result.get("base", {}).get("completion_raw") or ""
 
+    # 1.5) PRE-SAMPLING ESTIMATE (after we can count eligible fork tokens)
+    if "usage_estimate" not in result:
+        pot_tokens, pot_positions = count_potential_forking_tokens(token_entries)
+        result.setdefault(
+            "sampling_plan",
+            {
+                "potential_forking_tokens": pot_tokens,
+                "potential_forking_positions": pot_positions,
+                "greedy_completion_T": len(token_entries),
+            },
+        )
+        estimate = estimate_total_usage(
+            prompt, token_entries, pot_tokens, args.samples_per_fork
+        )
+        result["usage_estimate"] = estimate
+        safe_write_json(rollout_file, result)
+
     # 2) Fork sampling (resume-aware)
-    # Check if we still need any samples
     remaining = sum(_pending_samples_for_entry(e) for e in token_entries)
     if remaining > 0:
         await sample_fork_branches(
@@ -977,10 +1101,16 @@ async def generate_rollout_resume(
     # 3) o0 (baseline) if missing
     outcome_distributions = result.setdefault("outcome_distributions", {})
     if "o0" not in outcome_distributions:
-        o0_dist = await sample_o0_distribution(
+        o0_dist, usage_delta = await sample_o0_distribution(
             problem_idx, prompt, semaphore=semaphore, samples=args.samples_per_fork
         )
         outcome_distributions["o0"] = o0_dist
+        _bump_usage(
+            result,
+            usage_delta.get("input_tokens", 0),
+            usage_delta.get("output_tokens", 0),
+            rollout_file,
+        )
         result["outcome_distributions"] = outcome_distributions
         result["status"] = "o0_sampled"
         safe_write_json(rollout_file, result)
@@ -1025,7 +1155,6 @@ async def process_problem(
     rollout_file = problem_dir / "rollout_analysis.json"
     error_file = problem_dir / "rollout_error.json"
 
-    # NEW: resume from file if it exists (unless --force)
     existing = None
     if rollout_file.exists() and not args.force:
         existing = load_json_if_exists(rollout_file)
@@ -1088,8 +1217,7 @@ async def main() -> None:
         if len(matched) > 1:
             matched_ids = ", ".join(str(idx) for idx, _ in matched)
             print(
-                "Substring matched multiple problems (indices: "
-                f"{matched_ids}). Refusing selection."
+                f"Substring matched multiple problems (indices: {matched_ids}). Refusing selection."
             )
             return
         problems = [matched[0]]

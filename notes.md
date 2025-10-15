@@ -15,8 +15,22 @@ Next tasks:
 - estimate the average sampling costs per problem with the thought anchors methodology --- DONE
 - test interruption and resume of rollout_generation --- DONE
 
-- execute full sampling on one problem 
+- execute full sampling on one problem --- DONE
+    -  problem: distribution empty for alternative tokens 
+    -  problem: distribution key __empty__ in o0
+
+    
 - run public thought anchors code on the same problem selected for forking tokens
+    - adapt generate_rollouts.py --- DONE
+    - adapt analyze_rollouts.py to work both on the locally generated data and on the hugging face dataset
+        - make LLM based labeling work with openrouter and openrouter spar api key
+        - how to use the new script generally? which command line arguments do what? How to analyze one single problem?
+    - test generate_rollouts.py
+    - test analyze_rollouts_v3.py
+    - execute analyze_rollouts_v3.py on the data (problem_330) coming from hugging face dataset (check below: CALL Thought anchors analyzer of hugging face datasets)
+    - compute precise estimation of costs for problem_330 and compare with costs of forking tokens on the same problem
+
+
 - empirically calculate the sampling cost of forking tokens
 - empirically calculate the sampling cost of thought anchors
 
@@ -28,5 +42,112 @@ Next tasks:
 
 
 
+
+
+
+
+
+
+
+
+
+
 Substring to match
 3(1+3(1+3(1+3(1+3(1+3(1+3(1+3(1+3(1+3)))))))))
+
+CALL Thought anchors analyzer of hugging face datasets
+python -m thought_anchors.analyze_rollouts_v3 \
+  --correct_rollouts_dir hf://uzaymacar/math-rollouts/deepseek-r1-distill-qwen-14b/temperature_0.6_top_p_0.95/correct_base_solution \
+  --incorrect_rollouts_dir hf://uzaymacar/math-rollouts/deepseek-r1-distill-qwen-14b/temperature_0.6_top_p_0.95/incorrect_base_solution \
+  --llm_provider none \
+  --importance_metric counterfactual_importance_accuracy \
+  --use_existing_metrics \
+  --problems "330"
+
+
+
+
+
+
+1) How to use the new analysis script
+
+You can run the script in two modes:
+
+Local-rollouts mode (use the rollouts produced by generate_rollouts.py).
+
+Hugging Face dataset mode (use the authors’ published dataset at uzaymacar/math-rollouts).
+
+Below is a quick map of the most useful flags, then some copy-paste examples (including “analyze one single problem”).
+
+Most useful CLI flags (plain-English)
+
+Input sources
+
+--correct_rollouts_dir / --incorrect_rollouts_dir
+Path to your locally generated rollouts (e.g. math_rollouts/.../correct_base_solution).
+If you want to analyze only correct or only incorrect runs, you can pass only one of them.
+
+--correct_forced_answer_rollouts_dir / --incorrect_forced_answer_rollouts_dir
+Path to the forced-answer rollouts (optional). If present, the script will compute and plot the “forced importance” metrics too.
+
+Scope filtering
+
+--problems "12,77,105"
+Only analyze these problem indices.
+
+--max_problems 50
+Cap how many problems to analyze (after any filtering).
+
+Labeling / metadata
+
+--force_relabel
+Re-run the LLM labeling even if chunks_labeled.json already exists.
+
+--force_metadata
+Re-generate chunk summaries and problem nicknames even if they exist.
+
+Importance metrics & knobs
+
+--importance_metric {counterfactual_importance_accuracy|counterfactual_importance_kl|resampling_importance_accuracy|resampling_importance_kl|forced_importance_accuracy|forced_importance_kl}
+Choose which metric the plots/tables center on.
+
+--absolute
+Use absolute value when computing importance deltas (handy if you only care about magnitude).
+
+--similarity_threshold 0.8
+Cosine similarity threshold to decide “similar vs dissimilar” resampled chunks.
+
+--use_similar_chunks/--no-use_similar_chunks
+Whether to include “similar” resamples when building the comparison distribution for KL metrics.
+
+--use_prob_true/--no-use_prob_true
+If on, KL is computed over P(correct) (binary). If off, KL is over the full answer distribution.
+
+Embeddings / performance
+
+--sentence_model all-MiniLM-L6-v2
+SBERT model for chunk embeddings.
+
+--batch_size 8192
+Embedding batch size (per encode step).
+
+--num_processes <N>
+CPU processes for importance computations (defaults to up to 100).
+
+Token-frequency analysis
+
+--token_analysis_source {dag|rollouts}
+If dag, set --dag_dir <path> to point at DAG-improved chunks. If rollouts, it uses the rollouts you’re analyzing.
+
+--get_token_frequencies
+Turn on n-gram plots per category.
+
+Output & plotting
+
+--output_dir analysis/basic
+Where all plots and JSON summaries go.
+
+--max_chunks_to_show 100
+Limit “accuracy-by-position” plots to the first N sentences to keep charts readable.
+
+The dataset you cited lives here and includes a “card” with usage instructions; we’re using the standard 🤗 datasets loader under the hood.
