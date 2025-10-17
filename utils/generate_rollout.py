@@ -1,3 +1,5 @@
+# generate_rollout.py — progressive saves + resume from checkpoint
+
 import os
 import sys
 import json
@@ -7,11 +9,13 @@ import asyncio
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+import unicodedata, re, ftfy
 
 import numpy as np
 import httpx
 from dotenv import load_dotenv
 from tqdm import tqdm
+from transformers import AutoTokenizer
 
 from utils.utils import (
     extract_boxed_answers,
@@ -23,11 +27,11 @@ from utils.utils import (
 
 load_dotenv()
 
-OPENROUTER_API_URL = "https://openrouter.ai/api/v1/completions"
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY_SPAR")
-if not OPENROUTER_API_KEY:
+NOVITA_API_URL = "https://api.novita.ai/openai/v1/completions"
+NOVITA_API_KEY = os.getenv("NOVITA_API_KEY_SPAR")
+if not NOVITA_API_KEY:
     raise RuntimeError(
-        "OPENROUTER_API_KEY is not set. Please define it in the environment or .env file."
+        "NOVITA_API_KEY is not set. Please define it in the environment or .env file."
     )
 GENERATIONS_DIRNAME = "data/generations"
 GENERATIONS_REGISTRY = "generations.json"
@@ -35,16 +39,15 @@ USAGE_FILENAME = "usage.json"
 
 import argparse
 
-
 parser = argparse.ArgumentParser(
-    description="Collect forked rollouts with outcome distributions and drift analysis."
+    description="Collect forked rollouts with outcome distributions and drift analysis (progressive + resumable)."
 )
 parser.add_argument(
     "-m",
     "--model",
     type=str,
-    default="deepseek/deepseek-r1-distill-llama-8b",  # "deepseek/deepseek-r1-0528:free",
-    help="Model identifier served via OpenRouter.",
+    default="deepseek/deepseek-r1-distill-qwen-14b",
+    help="Model identifier served via Novita.",
 )
 parser.add_argument(
     "-o",
@@ -53,175 +56,33 @@ parser.add_argument(
     default="math_rollouts",
     help="Root directory to store rollout artefacts.",
 )
+parser.add_argument("-np", "--num-problems", type=int, default=None)
+parser.add_argument("-bt", "--base-temperature", type=float, default=0.0)
+parser.add_argument("-t", "--temperature", type=float, default=0.7)
+parser.add_argument("-tp", "--top_p", type=float, default=0.95)
+parser.add_argument("-mt", "--max-tokens", type=int, default=4096)
+parser.add_argument("-cmt", "--continuation-max-tokens", type=int, default=15000)
+parser.add_argument("-sps", "--samples-per-fork", type=int, default=30)
+parser.add_argument("-atk", "--alternate-top-k", type=int, default=10)
+parser.add_argument("-amp", "--alternate-min-prob", type=float, default=0.05)
+parser.add_argument("-ctl", "--continuation-top-logprobs", type=int, default=1)
+parser.add_argument("-mr", "--max-retries", type=int, default=3)
+parser.add_argument("-s", "--seed", type=int, default=44)
+parser.add_argument("-f", "--force", action="store_true")
+parser.add_argument("-ty", "--type", type=str, default=None)
+parser.add_argument("-l", "--level", type=str, default=None)
 parser.add_argument(
-    "-np",
-    "--num-problems",
-    type=int,
-    default=None,
-    help="Maximum number of problems to process (after filtering).",
+    "-sp", "--split", type=str, default="train", choices=["train", "test"]
 )
-parser.add_argument(
-    "-bt",
-    "--base-temperature",
-    type=float,
-    default=0.0,
-    help="Temperature for the greedy base path generation.",
-)
-parser.add_argument(
-    "-t",
-    "--temperature",
-    type=float,
-    default=0.7,
-    help="Sampling temperature used for fork continuations.",
-)
-parser.add_argument(
-    "-tp",
-    "--top_p",
-    type=float,
-    default=0.95,
-    help="Top-p nucleus sampling parameter passed to the API.",
-)
-parser.add_argument(
-    "-mt",
-    "--max-tokens",
-    type=int,
-    default=4096,
-    help="Maximum tokens requested for the base path completion.",
-)
-parser.add_argument(
-    "-cmt",
-    "--continuation-max-tokens",
-    type=int,
-    default=15000,
-    help="Maximum tokens allowed for each fork continuation.",
-)
-parser.add_argument(
-    "-sps",
-    "--samples-per-fork",
-    type=int,
-    default=30,
-    help="Number of independent continuations sampled for every alternate token.",
-)
-parser.add_argument(
-    "-atk",
-    "--alternate-top-k",
-    type=int,
-    default=10,
-    help="Top-K alternate tokens to retain per position on the base path.",
-)
-parser.add_argument(
-    "-amp",
-    "--alternate-min-prob",
-    type=float,
-    default=0.05,
-    help="Minimum probability threshold for alternate tokens to spawn forks.",
-)
-parser.add_argument(
-    "-ctl",
-    "--continuation-top-logprobs",
-    type=int,
-    default=1,
-    help="Top logprobs to request for continuation samples (0 disables alternate capture).",
-)
-parser.add_argument(
-    "-mr",
-    "--max-retries",
-    type=int,
-    default=3,
-    help="Maximum retries for OpenRouter requests before failing a step.",
-)
-parser.add_argument(
-    "-s",
-    "--seed",
-    type=int,
-    default=44,
-    help="Seed for python and numpy RNGs.",
-)
-parser.add_argument(
-    "-f",
-    "--force",
-    action="store_true",
-    help="Force regeneration even if rollout artefacts already exist.",
-)
-parser.add_argument(
-    "-ty",
-    "--type",
-    type=str,
-    default=None,
-    help="Optional MATH dataset problem type filter.",
-)
-parser.add_argument(
-    "-l",
-    "--level",
-    type=str,
-    default=None,
-    help="Optional MATH dataset level filter.",
-)
-parser.add_argument(
-    "-sp",
-    "--split",
-    type=str,
-    default="train",
-    choices=["train", "test"],
-    help="Dataset split to sample from.",
-)
-parser.add_argument(
-    "-ip",
-    "--include-problems",
-    type=str,
-    default=None,
-    help="Comma-separated list of explicit problem indices to include.",
-)
-parser.add_argument(
-    "-ep",
-    "--exclude-problems",
-    type=str,
-    default=None,
-    help="Comma-separated list of problem indices to exclude.",
-)
-parser.add_argument(
-    "-cc",
-    "--concurrency",
-    type=int,
-    default=4,
-    help="Maximum concurrent OpenRouter requests.",
-)
-parser.add_argument(
-    "--problem-substring",
-    type=str,
-    default=None,
-    help="Case-insensitive substring to match a single problem statement.",
-)
-parser.add_argument(
-    "--frequency-penalty",
-    type=float,
-    default=None,
-    help="Optional frequency penalty forwarded to OpenRouter.",
-)
-parser.add_argument(
-    "--presence-penalty",
-    type=float,
-    default=None,
-    help="Optional presence penalty forwarded to OpenRouter.",
-)
-parser.add_argument(
-    "--repetition-penalty",
-    type=float,
-    default=None,
-    help="Optional repetition penalty forwarded to OpenRouter.",
-)
-parser.add_argument(
-    "--min-p",
-    type=float,
-    default=None,
-    help="Optional min-p sampling parameter forwarded to OpenRouter.",
-)
-parser.add_argument(
-    "--top-k",
-    type=int,
-    default=None,
-    help="Optional top-k sampling parameter forwarded to OpenRouter.",
-)
+parser.add_argument("-ip", "--include-problems", type=str, default=None)
+parser.add_argument("-ep", "--exclude-problems", type=str, default=None)
+parser.add_argument("-cc", "--concurrency", type=int, default=10)
+parser.add_argument("--problem-substring", type=str, default=None)
+parser.add_argument("--frequency-penalty", type=float, default=None)
+parser.add_argument("--presence-penalty", type=float, default=None)
+parser.add_argument("--repetition-penalty", type=float, default=None)
+parser.add_argument("--min-p", type=float, default=None)
+parser.add_argument("--top-k", type=int, default=None)
 args = parser.parse_args()
 
 output_dir = (
@@ -236,11 +97,164 @@ np.random.seed(args.seed)
 
 REQUEST_SEMAPHORE: Optional[asyncio.Semaphore] = None
 
+# ---------------- NEW: tokenizer cache & helpers ----------------
+
+_TOKENIZER_CACHE: Dict[str, Any] = {}
+
+
+def _guess_hf_tokenizer_name(model_name: str) -> str:
+    name = model_name.lower()
+    # Map DeepSeek R1 variants to the tokenizer they advertise
+    if "qwen" in name:
+        return "deepseek-ai/DeepSeek-R1-Distill-Qwen-14B"
+    elif "llama" in name:
+        return "deepseek-ai/DeepSeek-R1-Distill-Llama-8B"
+    else:
+        raise ValueError(f"Cannot guess tokenizer for model name: {model_name}")
+
+
+def get_tokenizer(model_name: str):
+    key = _guess_hf_tokenizer_name(model_name)
+    tok = _TOKENIZER_CACHE.get(key)
+    if tok is None:
+        tok = AutoTokenizer.from_pretrained(key, use_fast=True)
+        _TOKENIZER_CACHE[key] = tok
+    return tok
+
+
+def detok_for_api(token_str: str) -> Optional[str]:
+    """
+    Convert a *token string* (e.g., 'ĠNow', '.ĊĊ', '▁The') into true text
+    using the model's tokenizer. This avoids feeding display markers (Ġ/Ċ/▁) into the prompt.
+    """
+    if not isinstance(token_str, str) or token_str == "":
+        return None
+    tok = get_tokenizer(args.model)
+    tid = tok.convert_tokens_to_ids(token_str)
+    if isinstance(tid, int) and tid >= 0 and tid != tok.unk_token_id:
+        text = tok.decode([tid], clean_up_tokenization_spaces=False)
+        return text
+    else:
+        return None
+
+
+# ---------------- utility & API ----------------
+
+PRICES_PER_MTOK = {
+    # USD per 1M tokens
+    "deepseek/deepseek-r1-distill-qwen-14b": {"input": 0.15, "output": 0.15},
+}
+DEFAULT_PRICE = {"input": 0.15, "output": 0.15}
+
+
+def _price_per_token(model: str) -> Tuple[float, float]:
+    p = PRICES_PER_MTOK.get(model, DEFAULT_PRICE)
+    return p["input"] / 1_000_000.0, p["output"] / 1_000_000.0
+
+
+USD_PER_MTOK_INPUT = PRICES_PER_MTOK.get(args.model, DEFAULT_PRICE)["input"]
+USD_PER_MTOK_OUTPUT = PRICES_PER_MTOK.get(args.model, DEFAULT_PRICE)["output"]
+PER_TOKEN_INPUT, PER_TOKEN_OUTPUT = _price_per_token(args.model)
+
+# Shared HTTPX client (connection pooling + HTTP/2)
+HTTPX_CLIENT: Optional[httpx.AsyncClient] = None
+
+
+async def _get_httpx_client() -> httpx.AsyncClient:
+    """
+    One client for the whole run: enables connection pooling & keep-alive.
+    HTTP/2 allows multiplexing when the server supports it.
+    """
+    global HTTPX_CLIENT
+    if HTTPX_CLIENT is None:
+        limits = httpx.Limits(
+            max_connections=args.concurrency * 2,
+            max_keepalive_connections=args.concurrency,
+        )
+        HTTPX_CLIENT = httpx.AsyncClient(
+            timeout=240.0,
+            http2=True,  # enable HTTP/2 if server supports it
+            limits=limits,
+            headers=build_headers(),  # set auth once
+        )
+    return HTTPX_CLIENT
+
+
+def _ensure_current_usage(result_sink: Dict[str, Any]) -> None:
+    if "current_usage" not in result_sink:
+        result_sink["current_usage"] = {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "input_cost_usd": 0.0,
+            "output_cost_usd": 0.0,
+            "total_cost_usd": 0.0,
+        }
+
+
+def _add_usage_numbers(
+    result_sink: Dict[str, Any], prompt_tokens: int, completion_tokens: int
+) -> None:
+    _ensure_current_usage(result_sink)
+    cu = result_sink["current_usage"]
+    cu["input_tokens"] += int(prompt_tokens)
+    cu["output_tokens"] += int(completion_tokens)
+    cu["input_cost_usd"] += prompt_tokens * PER_TOKEN_INPUT
+    cu["output_cost_usd"] += completion_tokens * PER_TOKEN_OUTPUT
+    cu["total_cost_usd"] = cu["input_cost_usd"] + cu["output_cost_usd"]
+
+
+def _accumulate_from_api_response(
+    result_sink: Dict[str, Any],
+    prompt_tokens_fallback: int,
+    response_obj: Dict[str, Any],
+    completion_text_fallback: Optional[str],
+) -> None:
+    usage = (response_obj or {}).get("usage") or {}
+    pt = usage.get("prompt_tokens")
+    ct = usage.get("completion_tokens")
+    if isinstance(pt, int) and isinstance(ct, int):
+        _add_usage_numbers(result_sink, pt, ct)
+    else:
+        # Fallback: count tokens locally
+        ct_local = (
+            count_tokens(completion_text_fallback or "")
+            if completion_text_fallback
+            else 0
+        )
+        _add_usage_numbers(result_sink, prompt_tokens_fallback, ct_local)
+
+
+def safe_write_json(path: Path, data: Dict[str, Any]) -> None:
+    """
+    Atomic-ish write: dump to a temp file and replace the target.
+    On POSIX, replace/rename updates the path in one step so readers see old or new.
+    """
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+    os.replace(tmp, path)
+
+
+# count tokens with AutoTokenizer (no special tokens)
+def count_tokens(text: str) -> int:
+    tok = get_tokenizer(args.model)
+    enc = tok(text, add_special_tokens=False)
+    ids = enc.get("input_ids") or []
+    return len(ids)
+
+
+def load_json_if_exists(path: Path) -> Optional[Dict[str, Any]]:
+    if not path.exists():
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
 
 def record_generation(
-    generation_id: str,
-    problem_id: str,
-    response_json: Dict[str, Any],
+    generation_id: str, problem_id: str, response_json: Dict[str, Any]
 ) -> None:
     base_dir = Path(__file__).resolve().parents[1]
     generations_dir = base_dir / GENERATIONS_DIRNAME
@@ -260,23 +274,16 @@ def record_generation(
         "prompt_tokens": response_json.get("usage", {}).get("prompt_tokens"),
         "completion_tokens": response_json.get("usage", {}).get("completion_tokens"),
         "total_tokens": response_json.get("usage", {}).get("total_tokens"),
-        "api_key": "personal" if OPENROUTER_API_KEY.endswith("d9a98e3f1c2") else "spar",
+        "api_key": "novita",
     }
     append_to_json_array(usage_path, usage_entry)
 
 
 def build_headers() -> Dict[str, str]:
-    headers = {
-        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+    return {
+        "Authorization": f"Bearer {NOVITA_API_KEY}",
         "Content-Type": "application/json",
     }
-    referer = os.getenv("OPENROUTER_SITE_URL")
-    title = os.getenv("OPENROUTER_APP_NAME")
-    if referer:
-        headers["HTTP-Referer"] = referer
-    if title:
-        headers["X-Title"] = title
-    return headers
 
 
 async def make_api_request(
@@ -303,11 +310,8 @@ async def make_api_request(
         "max_tokens": max_tokens,
         "stream": False,
     }
-
-    if logprobs:
-        payload["logprobs"] = True
-        payload["top_logprobs"] = top_logprobs
-
+    if logprobs and top_logprobs > 0:
+        payload["logprobs"] = top_logprobs
     if frequency_penalty is not None:
         payload["frequency_penalty"] = frequency_penalty
     if presence_penalty is not None:
@@ -319,30 +323,26 @@ async def make_api_request(
     if top_k is not None:
         payload["top_k"] = top_k
 
-    headers = build_headers()
+    client = await _get_httpx_client()
     max_retries = retries if retries is not None else args.max_retries
     base_delay = 2.0
 
-    async def _send_request() -> httpx.Response:
-        async with httpx.AsyncClient(timeout=240) as client:
-            return await client.post(OPENROUTER_API_URL, headers=headers, json=payload)
+    async def _post() -> httpx.Response:
+        return await client.post(NOVITA_API_URL, json=payload)
 
     for attempt in range(max_retries):
         try:
             if semaphore:
                 async with semaphore:
-                    response = await _send_request()
+                    response = await _post()
             else:
-                response = await _send_request()
-
+                response = await _post()
             if response.status_code == 200:
                 return response.json()
-
             if response.status_code in (429, 500) and attempt < max_retries - 1:
                 jitter = random.uniform(0.5, 1.5)
                 await asyncio.sleep(base_delay * (2**attempt) * jitter)
                 continue
-
             return {
                 "error": f"API error: {response.status_code}",
                 "details": response.text,
@@ -351,92 +351,121 @@ async def make_api_request(
             if attempt == max_retries - 1:
                 return {"error": f"Request exception: {exc}"}
             await asyncio.sleep(base_delay * (2**attempt))
-
     return {"error": "All API request attempts failed"}
 
 
-def extract_choice_text(choice: Dict[str, Any]) -> str:
-    text = choice.get("text")
-    if isinstance(text, str):
-        return text
+# --- display cleaner (unchanged) ---
+def _clean_token_display(s: object) -> str:
+    text = s if isinstance(s, str) else str(s)
+    if not text:
+        return ""
+    if ftfy is not None:
+        text = ftfy.fix_encoding(text)
+    text = (
+        text.replace("▁", " ")
+        .replace("\u0120", " ")
+        .replace("Ġ", " ")
+        .replace("\u010a", "\n")
+        .replace("\u010b", "\n")
+        .replace("Ċ", "\n")
+        .replace("ċ", "\n")
+    )
+    text = text.replace("Ğ", " ").replace("ğ", " ")
+    text = unicodedata.normalize("NFC", text)
+    text = "".join(ch for ch in text if (ch.isprintable() or ch in "\n\t"))
+    text = re.sub(r"[ \t]+", " ", text)
+    text = "\n".join(line.rstrip() for line in text.splitlines())
+    return text
+
+
+STRUCTURAL_MAP = {"Ġ": " ", "\u0120": " ", "Ċ": "\n", "\u010a": "\n", "\u010b": "\n"}
+
+
+def is_safe_to_fork(token_str: str) -> bool:
+    decoded = detok_for_api(token_str)
+    if decoded is None:
+        return False
+    if any(
+        unicodedata.category(c).startswith("C") and c not in "\n\t" for c in decoded
+    ):
+        return False
+    return True
+
+
+def extract_choice_text(choice: Dict[str, Any]) -> Tuple[str, str]:
+    text_raw = choice.get("text")
+    if isinstance(text_raw, str):
+        text = _clean_token_display(text_raw)
+        return text_raw, text
     message = choice.get("message")
     if isinstance(message, dict):
         content = message.get("content")
         if isinstance(content, str):
-            return content
-    return ""
+            return content, _clean_token_display(content)
+    return "", ""
 
 
 def parse_top_logprob_block(block: Any) -> List[Dict[str, Any]]:
     candidates: List[Dict[str, Any]] = []
+
+    def _push(tok, lp):
+        candidates.append(
+            {
+                "token_raw": tok,
+                "token": _clean_token_display(tok),
+                "logprob": lp,
+                "probability": (math.exp(lp) if isinstance(lp, (int, float)) else None),
+            }
+        )
+
     if isinstance(block, dict):
         for token_value, logprob_value in block.items():
-            probability = (
-                math.exp(logprob_value)
-                if isinstance(logprob_value, (int, float))
-                else None
-            )
-            candidates.append(
-                {
-                    "token": token_value,
-                    "logprob": logprob_value,
-                    "probability": probability,
-                }
-            )
+            _push(token_value, logprob_value)
     elif isinstance(block, list):
         for item in block:
             if isinstance(item, dict):
-                token_value = item.get("token") or item.get("text")
-                logprob_value = item.get("logprob")
+                tok = item.get("token") or item.get("text")
+                lp = item.get("logprob")
+                if tok is not None:
+                    _push(tok, lp)
             elif isinstance(item, (list, tuple)) and len(item) == 2:
-                token_value, logprob_value = item
-            else:
-                continue
-            probability = (
-                math.exp(logprob_value)
-                if isinstance(logprob_value, (int, float))
-                else None
-            )
-            candidates.append(
-                {
-                    "token": token_value,
-                    "logprob": logprob_value,
-                    "probability": probability,
-                }
-            )
-    candidates.sort(key=lambda item: item.get("probability", 0.0) or 0.0, reverse=True)
+                tok, lp = item
+                _push(tok, lp)
+    candidates.sort(key=lambda it: it.get("probability", 0.0) or 0.0, reverse=True)
     return candidates
 
 
 def parse_logprob_entries(logprobs: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
     if not logprobs:
         return []
-
     entries: List[Dict[str, Any]] = []
     tokens = logprobs.get("tokens")
     token_logprobs = logprobs.get("token_logprobs")
     top_logprobs = logprobs.get("top_logprobs")
+    text_offsets = logprobs.get("text_offset") or logprobs.get("text_offsets")
 
     if isinstance(tokens, list) and isinstance(token_logprobs, list):
-        for idx, token_value in enumerate(tokens):
-            base_logprob = token_logprobs[idx] if idx < len(token_logprobs) else None
-            candidates_block = (
+        for idx, tok in enumerate(tokens):
+            lp = token_logprobs[idx] if idx < len(token_logprobs) else None
+            prob = math.exp(lp) if isinstance(lp, (int, float)) else None
+            top_block = (
                 top_logprobs[idx]
                 if isinstance(top_logprobs, list) and idx < len(top_logprobs)
-                else None
-            )
-            probability = (
-                math.exp(base_logprob)
-                if isinstance(base_logprob, (int, float))
                 else None
             )
             entries.append(
                 {
                     "token_index": idx,
-                    "token": token_value,
-                    "logprob": base_logprob,
-                    "probability": probability,
-                    "top_candidates": parse_top_logprob_block(candidates_block),
+                    "token_raw": tok,
+                    "token": _clean_token_display(tok),
+                    "logprob": lp,
+                    "probability": prob,
+                    "top_candidates": parse_top_logprob_block(top_block),
+                    "text_offset": (
+                        text_offsets[idx]
+                        if isinstance(text_offsets, list) and idx < len(text_offsets)
+                        else None
+                    ),
                 }
             )
         return entries
@@ -444,54 +473,59 @@ def parse_logprob_entries(logprobs: Optional[Dict[str, Any]]) -> List[Dict[str, 
     content = logprobs.get("content")
     if isinstance(content, list):
         for idx, block in enumerate(content):
-            token_value = ""
-            base_logprob = None
-            candidates_block = None
+            tok_raw, lp, top_block = "", None, None
             if isinstance(block, dict):
-                token_value = block.get("token") or block.get("text") or ""
-                base_logprob = block.get("logprob")
-                candidates_block = block.get("top_logprobs")
-            probability = (
-                math.exp(base_logprob)
-                if isinstance(base_logprob, (int, float))
-                else None
-            )
+                tok_raw = block.get("token") or block.get("text") or ""
+                lp = block.get("logprob")
+                top_block = block.get("top_logprobs")
+            prob = math.exp(lp) if isinstance(lp, (int, float)) else None
             entries.append(
                 {
                     "token_index": idx,
-                    "token": token_value,
-                    "logprob": base_logprob,
-                    "probability": probability,
-                    "top_candidates": parse_top_logprob_block(candidates_block),
+                    "token_raw": tok_raw,
+                    "token": _clean_token_display(tok_raw),
+                    "logprob": lp,
+                    "probability": prob,
+                    "top_candidates": parse_top_logprob_block(top_block),
+                    "text_offset": block.get("text_offset"),
                 }
             )
         return entries
-
     return entries
 
 
 def extract_tokens_and_logprobs(
     logprob_block: Optional[Dict[str, Any]],
-) -> Tuple[List[str], List[float]]:
+) -> Tuple[List[str], List[str], List[float]]:
     if not logprob_block:
-        return [], []
-
+        return [], [], []
+    if (
+        isinstance(logprob_block, dict)
+        and "tokens" in logprob_block
+        and "token_logprobs" in logprob_block
+    ):
+        tokens = logprob_block.get("tokens")
+        token_logprobs = logprob_block.get("token_logprobs")
+        tokens_out_raw, tokens_out, logprobs_out = [], [], []
+        for token, logprob in zip(tokens or [], token_logprobs or []):
+            tokens_out.append(_clean_token_display(token))
+            tokens_out_raw.append(token)
+            logprobs_out.append(logprob if isinstance(logprob, (int, float)) else 0.0)
+        return tokens_out_raw, tokens_out, logprobs_out
     content = logprob_block.get("content")
     if isinstance(content, list):
-        tokens_out: List[str] = []
-        logprobs_out: List[float] = []
+        tokens_out_raw, tokens_out, logprobs_out = [], [], []
         for item in content:
             if isinstance(item, dict):
                 token_value = item.get("token") or item.get("text") or ""
                 logprob_value = item.get("logprob")
-                tokens_out.append(token_value)
-                if isinstance(logprob_value, (int, float)):
-                    logprobs_out.append(logprob_value)
-                else:
-                    logprobs_out.append(0.0)
-        return tokens_out, logprobs_out
-
-    return [], []
+                tokens_out_raw.append(token_value)
+                tokens_out.append(_clean_token_display(token_value))
+                logprobs_out.append(
+                    logprob_value if isinstance(logprob_value, (int, float)) else 0.0
+                )
+        return tokens_out_raw, tokens_out, logprobs_out
+    return [], [], []
 
 
 def default_outcome_extractor(text: str) -> str:
@@ -518,69 +552,88 @@ def compute_tail_logprob_sums(token_entries: List[Dict[str, Any]]) -> List[float
     return tail_sums
 
 
-def build_outcome_distributions(
+def _normalize(dist: Dict[str, float]) -> Dict[str, float]:
+    total = sum(v for v in dist.values() if isinstance(v, (int, float)))
+    if total <= 0:
+        return {}
+    return {k: v / total for k, v in dist.items() if isinstance(v, (int, float))}
+
+
+def _weighted_add(dst: Dict[str, float], src: Dict[str, float], weight: float) -> None:
+    if weight <= 0:
+        return
+    for k, v in src.items():
+        dst[k] = dst.get(k, 0.0) + weight * v
+
+
+def _empirical_outcome_dist(samples: List[Dict[str, Any]]) -> Dict[str, float]:
+    counts: Dict[str, int] = defaultdict(int)
+    total = 0
+    for s in samples or []:
+        if s.get("error"):
+            continue
+        o = s.get("outcome")
+        if isinstance(o, str) and o:
+            counts[o] += 1
+            total += 1
+    if total == 0:
+        return {}
+    return {k: v / float(total) for k, v in counts.items()}
+
+
+def build_outcome_distributions_exact(
     base_outcome: str,
     token_entries: List[Dict[str, Any]],
-) -> Tuple[List[Dict[str, Any]], Dict[str, float]]:
-    tail_sums = compute_tail_logprob_sums(token_entries)
-    distributions: List[Dict[str, Any]] = []
+    *,
+    o0_dist: Optional[Dict[str, float]] = None,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """
+    Paper-conformant construction:
+      • For each (t,w): o_{t,w} is the empirical outcome histogram over S samples (equal weights).
+      • Mix across tokens: o_t ∝ Σ_w p(w|prefix) · o_{t,w}, renormalize over outcomes.
+      • Include o0 (t = -1) if provided.
+    """
+    ot_list: List[Dict[str, Any]] = []
+    otw_all: List[Dict[str, Any]] = []
 
-    for entry, tail_logprob in zip(token_entries, tail_sums):
-        distribution_weights: defaultdict[str, float] = defaultdict(float)
-        base_probability = entry.get("probability") or 0.0
-        if base_probability > 0:
-            continuation_probability = math.exp(tail_logprob)
-            distribution_weights[base_outcome] += (
-                base_probability * continuation_probability
-            )
+    if o0_dist:
+        ot_list.append({"t": -1, "token": "__o0__", "dist": dict(o0_dist)})
 
-        accounted_probability = base_probability
-        for branch in entry.get("branches", []):
-            fork_probability = branch.get("probability") or 0.0
-            if fork_probability <= 0:
+    for entry in token_entries:
+        t = entry.get("token_index")
+        token_at_t = entry.get("token") or ""
+        p_w_star = entry.get("probability") or 0.0
+
+        # Build a map of existing branches for this t (should include greedy after Patch 2)
+        branch_map = {br.get("token"): br for br in (entry.get("branches") or [])}
+
+        # --- Greedy branch o_{t,w*} from samples if present, else fallback to delta on base_outcome ---
+        greedy_branch = branch_map.get(token_at_t)
+        if greedy_branch and (greedy_branch.get("samples")):
+            dist_w_star = _empirical_outcome_dist(greedy_branch.get("samples"))
+        else:
+            # Fallback (should be rare if Patch 2 runs): delta at base outcome
+            dist_w_star = {base_outcome: 1.0} if base_outcome else {}
+        otw_all.append({"t": t, "w": token_at_t, "p_w": p_w_star, "dist": dist_w_star})
+
+        # --- Alternate branches: empirical outcome frequencies ---
+        for br_tok, br in branch_map.items():
+            if br_tok == token_at_t:
                 continue
-            accounted_probability += fork_probability
+            p_w = br.get("probability") or 0.0
+            dist_w = _empirical_outcome_dist(br.get("samples"))
+            otw_all.append({"t": t, "w": br_tok, "p_w": p_w, "dist": dist_w})
 
-            for sample in branch.get("samples", []):
-                if sample.get("error"):
-                    continue
-                continuation_probability = sample.get("continuation_probability")
-                if continuation_probability is None:
-                    logprob_sum = sample.get("logprob_sum")
-                    if isinstance(logprob_sum, (int, float)):
-                        continuation_probability = math.exp(logprob_sum)
-                    else:
-                        continuation_probability = 0.0
-                outcome = sample.get("outcome", "__unknown__")
-                distribution_weights[outcome] += (
-                    fork_probability * continuation_probability
-                )
+        # --- Mix across tokens for this t, then renormalize over outcomes ---
+        mix_raw: Dict[str, float] = defaultdict(float)
+        for rec in otw_all:
+            if rec["t"] != t:
+                continue
+            _weighted_add(mix_raw, rec["dist"], rec["p_w"])
+        o_t = _normalize(mix_raw)
+        ot_list.append({"t": t, "token": token_at_t, "dist": o_t})
 
-        accounted_probability = min(max(accounted_probability, 0.0), 1.0)
-        residual_probability = max(0.0, 1.0 - accounted_probability)
-        if residual_probability > 0:
-            distribution_weights["__residual__"] += residual_probability
-
-        total_weight = sum(distribution_weights.values())
-        normalized = (
-            {key: value / total_weight for key, value in distribution_weights.items()}
-            if total_weight > 0
-            else {}
-        )
-
-        distributions.append(
-            {
-                "token_index": entry.get("token_index"),
-                "token": entry.get("token"),
-                "raw_weights": dict(distribution_weights),
-                "normalized": normalized,
-                "total_weight": total_weight,
-                "residual_probability": residual_probability,
-            }
-        )
-
-    base_distribution = {base_outcome: 1.0}
-    return distributions, base_distribution
+    return ot_list, otw_all
 
 
 def l2_distance(dist_a: Dict[str, float], dist_b: Dict[str, float]) -> float:
@@ -590,32 +643,16 @@ def l2_distance(dist_a: Dict[str, float], dist_b: Dict[str, float]) -> float:
     )
 
 
-def compute_drift_series(
-    base_distribution: Dict[str, float],
-    distributions: List[Dict[str, Any]],
-) -> List[Dict[str, Any]]:
-    drift_series: List[Dict[str, Any]] = [
-        {
-            "token_index": -1,
-            "token": "__base__",
-            "drift": 0.0,
-            "outcomes_tracked": list(base_distribution.keys()),
-        }
-    ]
-
-    for distribution in distributions:
-        drift_series.append(
-            {
-                "token_index": distribution.get("token_index"),
-                "token": distribution.get("token"),
-                "drift": l2_distance(
-                    base_distribution, distribution.get("normalized", {})
-                ),
-                "outcomes_tracked": list(distribution.get("normalized", {}).keys()),
-            }
-        )
-
-    return drift_series
+def compute_drift_series_from_ot(ot_list: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    drift: List[Dict[str, Any]] = []
+    if not ot_list:
+        return drift
+    o0 = ot_list[0].get("dist", {}) or {}
+    for rec in ot_list:
+        t = rec.get("t", -1)
+        ot = rec.get("dist", {}) or {}
+        drift.append({"t": t, "drift": l2_distance(o0, ot)})
+    return drift
 
 
 async def collect_base_path(
@@ -640,33 +677,23 @@ async def collect_base_path(
         min_p=args.min_p,
         top_k=args.top_k,
     )
-
     if response.get("error"):
         return response
-
     choices = response.get("choices")
     if not choices:
-        return {"error": "OpenRouter response did not include any choices."}
+        return {"error": "Novita response did not include any choices."}
     record_generation(generation_id, str(problem_idx), response)
     choice = choices[0]
-    completion_text = extract_choice_text(choice)
-    print("base completion; response[choices][0]['logprobs']:", choice.get("logprobs"))
+    completion_text_raw, completion_text = extract_choice_text(choice)
     token_entries = parse_logprob_entries(choice.get("logprobs"))
-
-    prefix_accumulator = ""
-    for entry in token_entries:
-        entry["prefix_before"] = prefix_accumulator
-        token_text = entry.get("token") or ""
-        prefix_accumulator += token_text
-        entry["prefix_after"] = prefix_accumulator
 
     base_outcome = default_outcome_extractor(completion_text)
     is_correct = False
     if problem.get("gt_answer") and base_outcome and base_outcome != "__empty__":
         is_correct = check_answer(base_outcome, problem["gt_answer"])
-
     return {
         "completion_text": completion_text,
+        "completion_text_raw": completion_text_raw,
         "token_entries": token_entries,
         "base_outcome": base_outcome,
         "base_is_correct": is_correct,
@@ -674,19 +701,25 @@ async def collect_base_path(
     }
 
 
-def count_potential_forking_tokens(token_entries: List[Dict[str, Any]]) -> int:
+def count_potential_forking_tokens(
+    token_entries: List[Dict[str, Any]],
+) -> Tuple[int, int]:
+    # (unchanged)
     potential_forking_tokens = 0
     potential_forking_positions = 0
     for entry in token_entries:
         current_position_forking = False
         for candidate in entry.get("top_candidates", []):
-            candidate_token = candidate.get("token")
+            candidate_token = candidate.get("token_raw")
             candidate_probability = candidate.get("probability")
-            if not candidate_token or candidate_token == entry.get("token"):
+            if (not candidate_token) or (candidate_token == entry.get("token_raw")):
                 continue
-            if not isinstance(candidate_probability, (int, float)):
+            if not is_safe_to_fork(candidate_token):
                 continue
-            if candidate_probability < args.alternate_min_prob:
+            if (
+                not isinstance(candidate_probability, (int, float))
+                or candidate_probability < args.alternate_min_prob
+            ):
                 continue
             potential_forking_tokens += 1
             current_position_forking = True
@@ -695,32 +728,190 @@ def count_potential_forking_tokens(token_entries: List[Dict[str, Any]]) -> int:
     return potential_forking_tokens, potential_forking_positions
 
 
+# NEW: exact per-entry alternative count (same filters as sampling)
+def _count_valid_alternatives_for_entry(entry: Dict[str, Any]) -> int:
+    m = 0
+    for candidate in entry.get("top_candidates", []) or []:
+        cand_raw = candidate.get("token_raw")
+        cand_prob = candidate.get("probability")
+        if (
+            (not cand_raw)
+            or (cand_raw == entry.get("token_raw"))
+            or (not is_safe_to_fork(cand_raw))
+        ):
+            continue
+        if (not isinstance(cand_prob, (int, float))) or (
+            cand_prob < args.alternate_min_prob
+        ):
+            continue
+        m += 1
+    return m
+
+
+def estimate_fork_sampling_usage(
+    prompt: str, token_entries: List[Dict[str, Any]]
+) -> Dict[str, Any]:
+    """
+    For each position t with >=1 valid alternative:
+      - sample every valid alternative m_t : m_t * S samples
+      - sample greedy token w*             : S samples
+      - input tokens per sample ≈ len(prompt_tokens) + (t + 1)
+      - output tokens per sample ≈ T - (t + 1)
+    """
+    T = len(token_entries)
+    prompt_tokens = count_tokens(prompt)
+
+    total_in = 0
+    total_out = 0
+    positions_with_alts = 0
+    total_alt_tokens = 0
+    total_samples = 0
+
+    for entry in token_entries:
+        t = entry.get("token_index")
+        if not isinstance(t, int):
+            continue
+        m_t = _count_valid_alternatives_for_entry(entry)
+        if m_t <= 0:
+            continue
+        positions_with_alts += 1
+        total_alt_tokens += m_t
+
+        in_per = prompt_tokens + t + 1
+        out_per = max(0, T - (t + 1))
+
+        alt_samples_here = m_t * args.samples_per_fork
+        greedy_samples_here = args.samples_per_fork
+
+        total_in += (alt_samples_here + greedy_samples_here) * in_per
+        total_out += (alt_samples_here + greedy_samples_here) * out_per
+        total_samples += alt_samples_here + greedy_samples_here
+
+    input_cost = total_in * PER_TOKEN_INPUT
+    output_cost = total_out * PER_TOKEN_OUTPUT
+
+    return {
+        "estimated_input_tokens": int(total_in),
+        "estimated_output_tokens": int(total_out),
+        "estimated_input_cost_usd": float(input_cost),
+        "estimated_output_cost_usd": float(output_cost),
+        "estimated_total_cost_usd": float(input_cost + output_cost),
+        "positions_with_alternatives": int(positions_with_alts),
+        "total_alt_tokens_considered": int(total_alt_tokens),
+        "total_samples_planned": int(total_samples),
+        "assumptions": (
+            "Input per sample ≈ len(prompt)+t+1; output per sample ≈ T-(t+1); "
+            "we sample each valid alt token m_t for S times and also the greedy token S times, "
+            "with S=samples_per_fork and T=len(greedy_tokens)."
+        ),
+        "pricing": {
+            "model": args.model,
+            "usd_per_mtok_input": USD_PER_MTOK_INPUT,
+            "usd_per_mtok_output": USD_PER_MTOK_OUTPUT,
+        },
+    }
+
+
+def _existing_branch_map(entry: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    """Map token -> branch dict for quick lookup while resuming."""
+    out: Dict[str, Dict[str, Any]] = {}
+    for br in entry.get("branches", []) or []:
+        tok = br.get("token")
+        if isinstance(tok, str):
+            out[tok] = br
+    return out
+
+
+def _pending_samples_for_entry(entry: Dict[str, Any]) -> int:
+    """How many samples still needed for this entry (across all eligible alt tokens)."""
+    need = 0
+    existing = _existing_branch_map(entry)
+    for cand in entry.get("top_candidates", []) or []:
+        cand_raw = cand.get("token_raw")
+        cand_clean = cand.get("token")
+        cand_prob = cand.get("probability")
+        if (
+            (not cand_raw)
+            or (cand_raw == entry.get("token_raw"))
+            or (not is_safe_to_fork(cand_raw))
+        ):
+            continue
+        if (not isinstance(cand_prob, (int, float))) or (
+            cand_prob < args.alternate_min_prob
+        ):
+            continue
+        prev = existing.get(cand_clean, {})
+        have = len(prev.get("samples", []) or [])
+        if have < args.samples_per_fork:
+            need += args.samples_per_fork - have
+    return need
+
+
 async def sample_fork_branches(
     problem_idx: int,
     prompt: str,
     token_entries: List[Dict[str, Any]],
     *,
     semaphore: asyncio.Semaphore,
-    potential_forking_tokens: int,
+    base_completion_text_raw: str,
+    rollout_file: Path,
+    result_sink: Dict[str, Any],
 ) -> None:
-    # show progress bar with samples drawn out of total samples to draw
-    pbar = tqdm(
-        total=potential_forking_tokens * args.samples_per_fork,
-        desc="Sampling alternative branches",
-    )
+    """Resume-aware branch sampler. Saves progress to rollout_file after each branch update."""
+    total_needed = sum(_pending_samples_for_entry(e) for e in token_entries)
+    pbar = tqdm(total=total_needed, desc="Sampling alternative branches (resumable)")
+
     for entry in token_entries:
-        branches: List[Dict[str, Any]] = []
-        for candidate in entry.get("top_candidates", []):
-            candidate_token = candidate.get("token")
-            candidate_probability = candidate.get("probability")
-            if not candidate_token or candidate_token == entry.get("token"):
+        # Prepare existing branches dict for this entry (if any)
+        entry.setdefault("branches", [])
+        existing_map = _existing_branch_map(entry)
+        entry.setdefault("alt_candidates", [])
+
+        # ---------- sample alternate token branches w != w* ----------
+        alt_tokens_at_this_position = False
+        for candidate in list(entry.get("top_candidates", []) or []):
+            cand_raw = candidate.get("token_raw")
+            cand_clean = candidate.get("token")
+            cand_prob = candidate.get("probability")
+            if (
+                (not cand_raw)
+                or (cand_raw == entry.get("token_raw"))
+                or (not is_safe_to_fork(cand_raw))
+            ):
+                entry["top_candidates"].remove(candidate)
                 continue
-            if not isinstance(candidate_probability, (int, float)):
+            if (not isinstance(cand_prob, (int, float))) or (
+                cand_prob < args.alternate_min_prob
+            ):
+                entry["top_candidates"].remove(candidate)
                 continue
-            if candidate_probability < args.alternate_min_prob:
+            alt_tokens_at_this_position = True
+            # Build fork prompt with char offsets + decoded token text
+            offset = entry.get("text_offset")
+            if not isinstance(offset, int):
+                offset = 0
+            alt_text = detok_for_api(cand_raw)
+            if alt_text is None:
+                # skip if can't decode safely
+                continue
+            fork_prompt = f"{prompt}{base_completion_text_raw[:offset]}{alt_text}"
+            prompt_tokens_branch = count_tokens(fork_prompt)
+            # Compact entry
+            candidate.pop("token_raw", None)
+            candidate.pop("logprob", None)
+            entry["alt_candidates"].append(candidate)
+            # Ensure branch container exists
+            branch = existing_map.get(cand_clean)
+            if branch is None:
+                branch = {"token": cand_clean, "probability": cand_prob, "samples": []}
+                entry["branches"].append(branch)
+                existing_map[cand_clean] = branch
+
+            have = len(branch.get("samples", []) or [])
+            need = max(0, args.samples_per_fork - have)
+            if need == 0:
                 continue
 
-            fork_prompt = f"{prompt}{entry.get('prefix_before', '')}{candidate_token}"
             tasks = [
                 make_api_request(
                     fork_prompt,
@@ -736,145 +927,283 @@ async def sample_fork_branches(
                     min_p=args.min_p,
                     top_k=args.top_k,
                 )
-                for _ in range(args.samples_per_fork)
+                for _ in range(need)
             ]
             responses = await asyncio.gather(*tasks, return_exceptions=True)
-            pbar.update(args.samples_per_fork)
 
-            # create a unique generation_id for every sample in this set of samples
-            for i in range(args.samples_per_fork):
-                generation_id = generate_timestamp_id()
-                record_generation(generation_id, str(problem_idx), responses[i])
+            # Record usage for each response
+            for res in responses:
+                gen_id = generate_timestamp_id()
+                if isinstance(res, dict):
+                    record_generation(gen_id, str(problem_idx), res)
 
-            samples: List[Dict[str, Any]] = []
-
-            for sample_idx, result in enumerate(responses):
-                if isinstance(result, Exception):
-                    samples.append({"sample_index": sample_idx, "error": str(result)})
+            for add_idx, result_resp in enumerate(responses):
+                sample_idx = have + add_idx  # next index
+                if isinstance(result_resp, Exception):
+                    branch["samples"].append(
+                        {"sample_index": sample_idx, "error": str(result_resp)}
+                    )
                     continue
-
-                if not isinstance(result, dict):
-                    samples.append(
+                if not isinstance(result_resp, dict):
+                    branch["samples"].append(
                         {"sample_index": sample_idx, "error": "Invalid response object"}
                     )
                     continue
-
-                if result.get("error"):
-                    samples.append(
+                if result_resp.get("error"):
+                    branch["samples"].append(
                         {
                             "sample_index": sample_idx,
-                            "error": result.get("error"),
-                            "details": result.get("details"),
+                            "error": result_resp.get("error"),
+                            "details": result_resp.get("details"),
                         }
                     )
                     continue
-
-                sample_choices = result.get("choices") or []
+                sample_choices = result_resp.get("choices") or []
                 if not sample_choices:
-                    samples.append(
+                    branch["samples"].append(
                         {"sample_index": sample_idx, "error": "No choices returned"}
                     )
                     continue
-                print(f"Prompt for forking token {candidate_token} to continue from:")
-                print(f"{fork_prompt}")
-                print(f"\nSampled continuation: {sample_choices[0]}")
+
                 sample_choice = sample_choices[0]
-                sample_text = extract_choice_text(sample_choice)
-                sample_tokens, sample_logprobs = extract_tokens_and_logprobs(
-                    sample_choice.get("logprobs")
+                sample_text_raw, sample_text = extract_choice_text(sample_choice)
+                # --- progressive usage accounting (API usage if available; fallback = tokenized text) ---
+                _accumulate_from_api_response(
+                    result_sink, prompt_tokens_branch, result_resp, sample_text
                 )
-                print(f"Sampled text: {sample_text}")
-                print(f"Extracted tokens: {sample_tokens}")
 
                 logprob_sum = sum(
-                    value
-                    for value in sample_logprobs
-                    if isinstance(value, (int, float))
+                    v
+                    for v in (
+                        sample_choice.get("logprobs", {}).get("token_logprobs") or []
+                    )
+                    if isinstance(v, (int, float))
                 )
                 continuation_probability = (
-                    math.exp(logprob_sum) if sample_logprobs else "Unknown"
+                    math.exp(logprob_sum)
+                    if sample_choice.get("logprobs")
+                    else "Unknown"
                 )
                 outcome = default_outcome_extractor(sample_text)
-
-                samples.append(
+                branch["samples"].append(
                     {
                         "sample_index": sample_idx,
                         "final_answer_text": sample_text,
-                        "tokens": sample_tokens,
                         "logprob_sum": logprob_sum,
                         "continuation_probability": continuation_probability,
                         "outcome": outcome,
                     }
                 )
-                sys.exit(0)
 
-            branches.append(
-                {
-                    "token": candidate_token,
-                    "probability": candidate_probability,
-                    "logprob": candidate.get("logprob"),
-                    "samples": samples,
-                }
+            # Persist progress (includes updated current_usage)
+            result_sink["token_steps"] = token_entries
+            result_sink["status"] = "fork_sampling_in_progress"
+            safe_write_json(rollout_file, result_sink)
+
+            pbar.update(need)
+        # ---------- sample greedy token branch w* ----------
+        if alt_tokens_at_this_position:
+            w_star_raw = entry.get("token_raw")
+            w_star_clean = entry.get("token")
+            p_w_star = entry.get("probability") or 0.0
+            offset = entry.get("text_offset")
+            if not isinstance(offset, int):
+                offset = 0
+            w_star_text = (
+                detok_for_api(w_star_raw) if isinstance(w_star_raw, str) else None
             )
-            entry["branches"] = branches
-        pbar.close()
-        entry["branches"] = branches
+            if w_star_text:
+                fork_prompt_w_star = (
+                    f"{prompt}{base_completion_text_raw[:offset]}{w_star_text}"
+                )
+                prompt_tokens_branch = count_tokens(fork_prompt_w_star)
+
+                # ensure a branch object exists for the greedy token
+                entry.setdefault("branches", [])
+                existing_map = _existing_branch_map(entry)
+                branch_star = existing_map.get(w_star_clean)
+                if branch_star is None:
+                    branch_star = {
+                        "token": w_star_clean,
+                        "probability": p_w_star,
+                        "samples": [],
+                    }
+                    entry["branches"].append(branch_star)
+                    existing_map[w_star_clean] = branch_star
+
+                have = len(branch_star.get("samples", []) or [])
+                need = max(0, args.samples_per_fork - have)
+                if need > 0:
+                    tasks = [
+                        make_api_request(
+                            fork_prompt_w_star,
+                            temperature=args.temperature,
+                            top_p=args.top_p,
+                            max_tokens=args.continuation_max_tokens,
+                            top_logprobs=args.continuation_top_logprobs,
+                            logprobs=True,
+                            semaphore=semaphore,
+                            frequency_penalty=args.frequency_penalty,
+                            presence_penalty=args.presence_penalty,
+                            repetition_penalty=args.repetition_penalty,
+                            min_p=args.min_p,
+                            top_k=args.top_k,
+                        )
+                        for _ in range(need)
+                    ]
+                    responses = await asyncio.gather(*tasks, return_exceptions=True)
+
+                    for res in responses:
+                        gen_id = generate_timestamp_id()
+                        if isinstance(res, dict):
+                            record_generation(gen_id, str(problem_idx), res)
+
+                    for add_idx, result_resp in enumerate(responses):
+                        sample_idx = have + add_idx
+                        if isinstance(result_resp, Exception):
+                            branch_star["samples"].append(
+                                {"sample_index": sample_idx, "error": str(result_resp)}
+                            )
+                            continue
+                        if not isinstance(result_resp, dict):
+                            branch_star["samples"].append(
+                                {
+                                    "sample_index": sample_idx,
+                                    "error": "Invalid response object",
+                                }
+                            )
+                            continue
+                        if result_resp.get("error"):
+                            branch_star["samples"].append(
+                                {
+                                    "sample_index": sample_idx,
+                                    "error": result_resp.get("error"),
+                                    "details": result_resp.get("details"),
+                                }
+                            )
+                            continue
+                        sample_choices = result_resp.get("choices") or []
+                        if not sample_choices:
+                            branch_star["samples"].append(
+                                {
+                                    "sample_index": sample_idx,
+                                    "error": "No choices returned",
+                                }
+                            )
+                            continue
+
+                        sample_choice = sample_choices[0]
+                        _, sample_text = extract_choice_text(sample_choice)
+
+                        # --- progressive usage accounting ---
+                        _accumulate_from_api_response(
+                            result_sink, prompt_tokens_branch, result_resp, sample_text
+                        )
+
+                        logprob_sum = sum(
+                            v
+                            for v in (
+                                sample_choice.get("logprobs", {}).get("token_logprobs")
+                                or []
+                            )
+                            if isinstance(v, (int, float))
+                        )
+                        continuation_probability = (
+                            math.exp(logprob_sum)
+                            if sample_choice.get("logprobs")
+                            else "Unknown"
+                        )
+                        outcome = default_outcome_extractor(sample_text)
+                        branch_star["samples"].append(
+                            {
+                                "sample_index": sample_idx,
+                                "final_answer_text": sample_text,
+                                "logprob_sum": logprob_sum,
+                                "continuation_probability": continuation_probability,
+                                "outcome": outcome,
+                            }
+                        )
+
+                    # Persist progress (includes updated current_usage)
+                    result_sink["token_steps"] = token_entries
+                    result_sink["status"] = "fork_sampling_in_progress"
+                    safe_write_json(rollout_file, result_sink)
+                    pbar.update(need)
+
+        if entry["branches"] == []:
+            entry.pop("branches", None)
+        # for entry in token_entries:
+        entry.pop("token_raw", None)
+        entry.pop("logprob", None)
+        entry.pop("top_candidates", None)
+
+    pbar.close()
 
 
-async def generate_rollout(
+async def sample_o0_distribution(
+    problem_idx: int,
+    prompt: str,
+    *,
+    semaphore: asyncio.Semaphore,
+    samples: int,
+) -> Dict[str, float]:
+    tasks = [
+        make_api_request(
+            prompt,
+            temperature=args.temperature,
+            top_p=args.top_p,
+            max_tokens=args.continuation_max_tokens,
+            logprobs=False,
+            semaphore=semaphore,
+            frequency_penalty=args.frequency_penalty,
+            presence_penalty=args.presence_penalty,
+            repetition_penalty=args.repetition_penalty,
+            min_p=args.min_p,
+            top_k=args.top_k,
+        )
+        for _ in range(samples)
+    ]
+    responses = await asyncio.gather(*tasks, return_exceptions=True)
+
+    for r in responses:
+        gen_id = generate_timestamp_id()
+        if isinstance(r, dict):
+            record_generation(gen_id, str(problem_idx), r)
+
+    counts: Dict[str, int] = defaultdict(int)
+    valid = 0
+    for r in responses:
+        if not isinstance(r, dict) or r.get("error"):
+            continue
+        ch = (r.get("choices") or [None])[0]
+        if not ch:
+            continue
+        _, txt = extract_choice_text(ch)
+        outcome = default_outcome_extractor(txt)
+        if isinstance(outcome, str) and outcome:
+            counts[outcome] += 1
+            valid += 1
+
+    if valid == 0:
+        return {}
+
+    return {k: v / float(valid) for k, v in counts.items()}
+
+
+async def generate_rollout_resume(
     problem_idx: int,
     problem: Dict[str, Any],
     *,
     semaphore: asyncio.Semaphore,
+    rollout_file: Path,
+    existing: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    prompt = (
-        "Solve this math problem step by step. You MUST put your final answer in \\boxed{}."
-        " Problem: "
-        f"{problem['problem']} Solution: \n<think>\n"
-    )
-
-    base_data = await collect_base_path(
-        problem, problem_idx, prompt, semaphore=semaphore
-    )
-    if base_data.get("error"):
-        return {
-            "problem_index": problem_idx,
-            "error": base_data.get("error"),
-            "details": base_data.get("details"),
-        }
-    print(f"Base completion for problem {problem_idx} collected.")
-    token_entries = base_data.get("token_entries", [])
-    print(f"A total of {len(token_entries)} tokens in base path.")
-    potential_forking_tokens, potential_forking_positions = (
-        count_potential_forking_tokens(token_entries)
-    )
-    print(
-        f"Identified {potential_forking_tokens} potential forking tokens across "
-        f"{potential_forking_positions} potential forking positions."
-    )
-    print(
-        f"Now for every of the {potential_forking_tokens} potential forking token, a set of {args.samples_per_fork} samples will be drawn.",
-    )
-    print(
-        f"\nResulting in a total of {potential_forking_tokens * args.samples_per_fork} additional model calls.",
-    )
-
-    await sample_fork_branches(
-        problem_idx,
-        prompt,
-        token_entries,
-        semaphore=semaphore,
-        potential_forking_tokens=potential_forking_tokens,
-    )
-
-    outcome_distributions, base_distribution = build_outcome_distributions(
-        base_data.get("base_outcome", "__empty__"), token_entries
-    )
-    drift_series = compute_drift_series(base_distribution, outcome_distributions)
-
-    return {
-        "problem_index": problem_idx,
-        "metadata": {
+    # (skeleton setup unchanged)
+    result: Dict[str, Any] = existing or {}
+    result.setdefault("problem_index", problem_idx)
+    result.setdefault(
+        "metadata",
+        {
             "model": args.model,
             "base_temperature": args.base_temperature,
             "sample_temperature": args.temperature,
@@ -885,115 +1214,206 @@ async def generate_rollout(
             "alternate_top_k": args.alternate_top_k,
             "alternate_min_prob": args.alternate_min_prob,
         },
-        "prompt": prompt,
-        "problem": {
+    )
+    result.setdefault(
+        "problem",
+        {
             "problem_text": problem.get("problem"),
             "level": problem.get("level"),
             "type": problem.get("type"),
             "gt_answer": problem.get("gt_answer"),
         },
-        "base": {
+    )
+
+    prompt = result.get("prompt")
+    if not isinstance(prompt, str):
+        prompt = (
+            "Solve this math problem step by step. You MUST put your final answer in \\boxed{}."
+            " Problem: "
+            f"{problem['problem']} Solution: \n<think>\n"
+        )
+        result["prompt"] = prompt
+        safe_write_json(rollout_file, result)
+
+    # 1) Base path (if missing)
+    if "base" not in result or "token_steps" not in result:
+        base_data = await collect_base_path(
+            problem, problem_idx, prompt, semaphore=semaphore
+        )
+        if base_data.get("error"):
+            return {
+                "problem_index": problem_idx,
+                "error": base_data.get("error"),
+                "details": base_data.get("details"),
+            }
+        result["base"] = {
             "completion": base_data.get("completion_text"),
+            "completion_raw": base_data.get("completion_text_raw"),
             "outcome": base_data.get("base_outcome"),
             "is_correct": base_data.get("base_is_correct"),
-        },
-        "token_steps": token_entries,
-        "outcome_distributions": outcome_distributions,
-        "drift_series": drift_series,
-    }
+        }
+        result["token_steps"] = base_data.get("token_entries", [])
+        result["status"] = "base_collected"
+        safe_write_json(rollout_file, result)
+
+    token_entries = result.get("token_steps", [])
+    base_completion_text_raw: str = result.get("base", {}).get("completion_raw") or ""
+
+    if "estimated_usage" not in result:
+        try:
+            estimate = estimate_fork_sampling_usage(result["prompt"], token_entries)
+        except Exception as e:
+            estimate = {
+                "error": f"estimation_failed: {e}",
+                "estimated_input_tokens": 0,
+                "estimated_output_tokens": 0,
+                "estimated_input_cost_usd": 0.0,
+                "estimated_output_cost_usd": 0.0,
+                "estimated_total_cost_usd": 0.0,
+            }
+        result["estimated_usage"] = estimate
+        _ensure_current_usage(result)  # initialize progressive counters to zero
+        safe_write_json(rollout_file, result)
+
+    # 2) Fork sampling (resume-aware)
+    remaining = sum(_pending_samples_for_entry(e) for e in token_entries)
+    if remaining > 0:
+        await sample_fork_branches(
+            problem_idx,
+            prompt,
+            token_entries,
+            semaphore=semaphore,
+            base_completion_text_raw=base_completion_text_raw,
+            rollout_file=rollout_file,
+            result_sink=result,
+        )
+        result["token_steps"] = token_entries
+        result["status"] = "fork_sampling_done"
+        safe_write_json(rollout_file, result)
+
+    # 3) o0 omitted in this script (as in your provided version)
+
+    # 4) Build ot / otw if missing
+    outcome_distributions = result.setdefault("outcome_distributions", {})
+    if ("ot" not in outcome_distributions) or ("otw" not in outcome_distributions):
+        ot_list, otw_list = build_outcome_distributions_exact(
+            result.get("base", {}).get("outcome", "__empty__"),
+            token_entries,
+            o0_dist=None,  # this script version omits o0 sampling
+        )
+        outcome_distributions["ot"] = ot_list
+        outcome_distributions["otw"] = otw_list
+        result["outcome_distributions"] = outcome_distributions
+        result["status"] = "ot_built"
+        safe_write_json(rollout_file, result)
+
+    # 5) Drift series if missing
+    if "drift_series" not in result:
+        drift_series = compute_drift_series_from_ot(
+            result["outcome_distributions"]["ot"]
+        )
+        result["drift_series"] = drift_series
+        result["status"] = "done"
+        safe_write_json(rollout_file, result)
+
+    return result
 
 
 async def process_problem(
-    problem_idx: int,
-    problem: Dict[str, Any],
-    *,
-    semaphore: asyncio.Semaphore,
+    problem_idx: int, problem: Dict[str, Any], *, semaphore: asyncio.Semaphore
 ) -> None:
     problem_dir = output_dir / f"problem_{problem_idx}"
     problem_dir.mkdir(parents=True, exist_ok=True)
-
     problem_file = problem_dir / "problem.json"
     if not problem_file.exists() or args.force:
         with open(problem_file, "w", encoding="utf-8") as f:
-            json.dump(problem, f, indent=2)
+            json.dump(problem, f, indent=2, ensure_ascii=False)
 
     rollout_file = problem_dir / "rollout_analysis.json"
     error_file = problem_dir / "rollout_error.json"
 
+    # NEW: resume from file if it exists (unless --force)
+    existing = None
     if rollout_file.exists() and not args.force:
-        return
+        existing = load_json_if_exists(rollout_file)
+        if existing:
+            print(
+                f"[Resume] Found checkpoint for problem {problem_idx} with status={existing.get('status')}."
+            )
 
-    result = await generate_rollout(problem_idx, problem, semaphore=semaphore)
+    result = await generate_rollout_resume(
+        problem_idx,
+        problem,
+        semaphore=REQUEST_SEMAPHORE,
+        rollout_file=rollout_file,
+        existing=existing,
+    )
 
     if result.get("error"):
         with open(error_file, "w", encoding="utf-8") as f:
-            json.dump(result, f, indent=2)
+            json.dump(result, f, indent=2, ensure_ascii=False)
         return
-
     if error_file.exists():
         error_file.unlink()
-
-    with open(rollout_file, "w", encoding="utf-8") as f:
-        json.dump(result, f, indent=2)
 
 
 async def main() -> None:
     global REQUEST_SEMAPHORE
     REQUEST_SEMAPHORE = asyncio.Semaphore(args.concurrency)
-
-    problems = load_math_problems(
-        problem_type=args.type,
-        level=args.level,
-        num_problems=args.num_problems,
-        split=args.split,
-        include_problems=None,
-    )
-
-    if args.exclude_problems:
-        exclude_ids = {
-            int(pid.strip())
-            for pid in args.exclude_problems.split(",")
-            if pid.strip().isdigit()
-        }
-        problems = [(idx, prob) for idx, prob in problems if idx not in exclude_ids]
-
-    if args.include_problems:
-        include_ids = {
-            int(pid.strip())
-            for pid in args.include_problems.split(",")
-            if pid.strip().isdigit()
-        }
-        problems = [(idx, prob) for idx, prob in problems if idx in include_ids]
-
-    if args.problem_substring:
-        needle = args.problem_substring.lower()
-        matched = [
-            (idx, prob)
-            for idx, prob in problems
-            if isinstance(prob.get("problem"), str)
-            and needle in prob["problem"].lower()
-        ]
-        if not matched:
-            print(f"No problems contain substring '{args.problem_substring}'. Exiting.")
+    try:
+        problems = load_math_problems(
+            problem_type=args.type,
+            level=args.level,
+            num_problems=args.num_problems,
+            split=args.split,
+            include_problems=None,
+        )
+        if args.exclude_problems:
+            exclude_ids = {
+                int(pid.strip())
+                for pid in args.exclude_problems.split(",")
+                if pid.strip().isdigit()
+            }
+            problems = [(idx, prob) for idx, prob in problems if idx not in exclude_ids]
+        if args.include_problems:
+            include_ids = {
+                int(pid.strip())
+                for pid in args.include_problems.split(",")
+                if pid.strip().isdigit()
+            }
+            problems = [(idx, prob) for idx, prob in problems if idx in include_ids]
+        if args.problem_substring:
+            needle = args.problem_substring.lower()
+            matched = [
+                (idx, prob)
+                for idx, prob in problems
+                if isinstance(prob.get("problem"), str)
+                and needle in prob["problem"].lower()
+            ]
+            if not matched:
+                print(
+                    f"No problems contain substring '{args.problem_substring}'. Exiting."
+                )
+                return
+            if len(matched) > 1:
+                matched_ids = ", ".join(str(idx) for idx, _ in matched)
+                print(
+                    "Substring matched multiple problems (indices: "
+                    f"{matched_ids}). Refusing selection."
+                )
+                return
+            problems = [matched[0]]
+        if args.num_problems is not None:
+            problems = problems[: args.num_problems]
+        if not problems:
+            print("No problems selected. Exiting.")
             return
-        if len(matched) > 1:
-            matched_ids = ", ".join(str(idx) for idx, _ in matched)
-            print(
-                "Substring matched multiple problems (indices: "
-                f"{matched_ids}). Refusing selection."
-            )
-            return
-        problems = [matched[0]]
-
-    if args.num_problems is not None:
-        problems = problems[: args.num_problems]
-
-    if not problems:
-        print("No problems selected. Exiting.")
-        return
-
-    for problem_idx, problem in tqdm(problems, desc="Processing problems"):
-        await process_problem(problem_idx, problem, semaphore=REQUEST_SEMAPHORE)
+        for problem_idx, problem in tqdm(problems, desc="Processing problems"):
+            await process_problem(problem_idx, problem, semaphore=REQUEST_SEMAPHORE)
+    finally:
+        client = HTTPX_CLIENT
+        if client is not None:
+            await client.aclose()
 
 
 if __name__ == "__main__":
