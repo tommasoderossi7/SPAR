@@ -14,7 +14,13 @@ from dotenv import load_dotenv
 import re
 from collections import Counter, defaultdict
 from sentence_transformers import SentenceTransformer
-from utils.utils import normalize_answer, split_solution_into_chunks, DAG_PROMPT
+from utils.utils import (
+    normalize_answer,
+    split_solution_into_chunks,
+    DAG_PROMPT,
+    NICKNAME_PROMPT,
+    SUMMARY_PROMPT,
+)
 import math
 import multiprocessing as mp
 from functools import partial
@@ -206,27 +212,21 @@ parser.add_argument(
 parser.add_argument(
     "--llm_provider",
     type=str,
-    default="novita",
-    choices=["novita", "none"],
+    default="openrouter",
+    choices=["openrouter", "none"],
     help="Provider for small metadata generations (nicknames, chunk summaries, DAG). 'none' skips.",
 )
 parser.add_argument(
     "--llm_model",
     type=str,
-    default="deepseek/deepseek-r1-distill-qwen-14b",
-    help="LLM model to use on Novita for summaries/labels",
-)
-parser.add_argument(
-    "--novita_api_base",
-    type=str,
-    default="https://api.novita.ai/v3/openai/completions",
-    help="Novita OpenAI-compatible completions endpoint",
+    default="openai/gpt-4o-mini",
+    help="LLM model to use on OpenRouter for summaries/labels",
 )
 parser.add_argument(
     "--llm_temperature", type=float, default=0.0, help="Temperature for metadata calls"
 )
 parser.add_argument(
-    "--llm_max_tokens", type=int, default=128, help="Max tokens for metadata calls"
+    "--llm_max_tokens", type=int, default=20, help="Max tokens for metadata calls"
 )
 
 args = parser.parse_args()
@@ -259,30 +259,26 @@ FIGSIZE = (20, 7)
 # Env / tokenizer
 # ---------------------------
 load_dotenv()
-NOVITA_API_KEY = os.getenv("NOVITA_API_KEY")
 
-if args.llm_provider == "novita" and not NOVITA_API_KEY:
-    raise ValueError(
-        "NOVITA_API_KEY not found. Set it or run with --llm_provider none."
+if args.llm_provider == "openrouter":
+    OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY_SPAR") or os.getenv(
+        "OPENROUTER_API_KEY"
+    )
+    if not OPENROUTER_API_KEY:
+        raise ValueError(
+            "OPENROUTER_API_KEY_SPAR (or OPENROUTER_API_KEY) not found in .env"
+        )
+
+    client = OpenAI(
+        base_url="https://openrouter.ai/api/v1",
+        api_key=OPENROUTER_API_KEY,
+        # These are optional but recommended by OpenRouter
+        default_headers={
+            "HTTP-Referer": os.getenv("OPENROUTER_HTTP_REFERER", "https://local"),
+            "X-Title": os.getenv("OPENROUTER_X_TITLE", "Math Rollouts Analysis"),
+        },
     )
 
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY_SPAR") or os.getenv(
-    "OPENROUTER_API_KEY"
-)
-if not OPENROUTER_API_KEY:
-    raise ValueError(
-        "OPENROUTER_API_KEY_SPAR (or OPENROUTER_API_KEY) not found in .env"
-    )
-
-client = OpenAI(
-    base_url="https://openrouter.ai/api/v1",
-    api_key=OPENROUTER_API_KEY,
-    # These are optional but recommended by OpenRouter
-    default_headers={
-        "HTTP-Referer": os.getenv("OPENROUTER_HTTP_REFERER", "https://local"),
-        "X-Title": os.getenv("OPENROUTER_X_TITLE", "Math Rollouts Analysis"),
-    },
-)
 
 # Tokenizer for token counts (same as in paper’s models list)
 # (deepseek R1-distill qwen-14b)
@@ -385,96 +381,6 @@ stopwords = {
     "as",
     "us",
 }
-
-
-# ---------------------------
-# Novita LLM helpers (OpenAI-compatible completions)
-# ---------------------------
-def novita_complete(
-    prompt: str, temperature: float = None, max_tokens: int = None, model: str = None
-) -> str:
-    """Minimal wrapper for Novita /completions endpoint (non-stream)."""
-    if args.llm_provider == "none":
-        return ""
-
-    headers = {
-        "Authorization": f"Bearer {NOVITA_API_KEY}",
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "model": model or args.llm_model,
-        "prompt": prompt,
-        "temperature": args.llm_temperature if temperature is None else temperature,
-        "top_p": 0.95,
-        "max_tokens": args.llm_max_tokens if max_tokens is None else max_tokens,
-        "stream": False,
-        "n": 1,
-    }
-    # backoff retries
-    delay = 2.0
-    for attempt in range(4):
-        try:
-            with httpx.Client(timeout=60) as client:
-                r = client.post(args.novita_api_base, headers=headers, json=payload)
-                if r.status_code == 200:
-                    data = r.json()
-                    return data["choices"][0]["text"]
-                elif r.status_code in (429, 500, 502, 503):
-                    time.sleep(delay * (2**attempt))
-                else:
-                    print(f"[Novita] Error {r.status_code}: {r.text}")
-                    break
-        except Exception as e:
-            print(f"[Novita] Exception: {e}")
-            time.sleep(delay * (2**attempt))
-    return ""
-
-
-# ---------------------------
-# Lightweight prompts (embedded)
-# ---------------------------
-DAG_PROMPT = """You are labeling reasoning steps (chunks) from a math solution.
-
-Task:
-Given the problem statement and the list of numbered chunks (Chunk i: <text>),
-assign for EACH chunk:
-  - function_tags: a small list of snake_case tags (e.g., planning_step, fact_retrieval, equation_setup, algebraic_transformation, numeric_computation, verification, final_answer, dead_end, irrelevant).
-  - depends_on: list of prior chunk indices this chunk depends on (strings of indices; e.g., ["0","3"]).
-
-Output STRICT JSON with keys "chunks": an object whose keys are the chunk indices ("0","1","2",...) and values are objects of the form:
-  { "function_tags": [...], "depends_on": [...] }
-
-Example:
-{
-  "chunks": {
-    "0": {"function_tags": ["planning_step"], "depends_on": []},
-    "1": {"function_tags": ["equation_setup"], "depends_on": ["0"]},
-    "2": {"function_tags": ["numeric_computation"], "depends_on": ["1"]}
-  }
-}
-
-Problem:
-{problem_text}
-
-Chunks:
-{full_chunked_text}
-
-Return ONLY the JSON object.
-"""
-
-SUMMARY_PROMPT_TMPL = """Provide a concise 2–4 word summary describing the concrete action or calculation in this text.
-Use lowercase words except variable names or proper math terms. Avoid meta words like "planning" or "reasoning".
-Text:
-{chunk}
-
-Summary:"""
-
-NICKNAME_PROMPT_TMPL = """Give a 2–4 word nickname for this math problem capturing the main concept or scenario.
-Capitalize the first word only.
-Problem:
-{problem}
-
-Nickname:"""
 
 
 def safe_json_parse(text: str) -> Optional[dict]:
@@ -600,13 +506,13 @@ class ImportanceArgs:
 def generate_chunk_summary(chunk_text: str) -> str:
     if args.llm_provider == "none":
         return "unknown action"
-    prompt = SUMMARY_PROMPT_TMPL.format(chunk=chunk_text.strip()[:1200])
+    prompt = SUMMARY_PROMPT.format(chunk=chunk_text.strip()[:1200])
     try:
         resp = client.chat.completions.create(
-            model="openai/gpt-4o-mini",
+            model=args.llm_model,
             messages=[{"role": "user", "content": prompt}],
-            temperature=0.0,
-            max_tokens=20,
+            temperature=args.llm_temperature,
+            max_tokens=args.llm_max_tokens,
         )
         summary = resp.choices[0].message.content.strip()
         # (post-processing unchanged)
@@ -619,13 +525,13 @@ def generate_chunk_summary(chunk_text: str) -> str:
 def generate_problem_nickname(problem_text: str) -> str:
     if args.llm_provider == "none":
         return "math problem"
-    prompt = NICKNAME_PROMPT_TMPL.format(problem=problem_text.strip()[:2000])
+    prompt = NICKNAME_PROMPT.format(problem=problem_text.strip()[:2000])
     try:
         resp = client.chat.completions.create(
-            model="openai/gpt-4o-mini",
+            model=args.llm_model,
             messages=[{"role": "user", "content": prompt}],
-            temperature=0.0,
-            max_tokens=20,
+            temperature=args.llm_temperature,
+            max_tokens=args.llm_max_tokens,
         )
         nickname = resp.choices[0].message.content.strip()
         return " ".join(nickname.replace('"', "").split()[:5])
@@ -652,10 +558,9 @@ def dag_label_chunks(problem_text: str, chunks: List[str]) -> Dict[str, Dict]:
     )
     try:
         resp = client.chat.completions.create(
-            model="openai/gpt-4o-mini",
+            model="openai/gpt-4o",
             messages=[{"role": "user", "content": prompt}],
             temperature=0.0,
-            max_tokens=20,
         )
         out = resp.choices[0].message.content
     except Exception as e:
@@ -664,6 +569,9 @@ def dag_label_chunks(problem_text: str, chunks: List[str]) -> Dict[str, Dict]:
     data = safe_json_parse(out)
     if not data or "chunks" not in data:
         # fallback: unknowns
+        print(
+            "chunks not in DAG response or dag labeling response empty, defaulting to unknown"
+        )
         return {
             "chunks": {
                 str(i): {"function_tags": ["unknown"], "depends_on": []}

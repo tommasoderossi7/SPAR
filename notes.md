@@ -22,21 +22,23 @@ Next tasks:
     
 - run public thought anchors code on the same problem selected for forking tokens
     - adapt generate_rollouts.py --- DONE
-    - adapt analyze_rollouts.py to work both on the locally generated data and on the hugging face dataset
+    - adapt analyze_rollouts.py to work both on the locally generated data and on the hugging face dataset --- DONE
         - make LLM based labeling work with openrouter and openrouter spar api key
         - how to use the new script generally? which command line arguments do what? How to analyze one single problem?
     - test generate_rollouts.py
+        - execute analyze_rollouts_v3.py on the data (problem_330) coming from hugging face dataset (check below: CALL Thought anchors analyzer of hugging face datasets)
+        - testing without any LLM-based labeling
     - test analyze_rollouts_v3.py
-    - execute analyze_rollouts_v3.py on the data (problem_330) coming from hugging face dataset (check below: CALL Thought anchors analyzer of hugging face datasets)
+
     - compute precise estimation of costs for problem_330 and compare with costs of forking tokens on the same problem
 
 
 - empirically calculate the sampling cost of forking tokens
 - empirically calculate the sampling cost of thought anchors
 
-- 1) integrate bayesian CPD to infer the forking indices
+- 1) compute the degree of overlap/correlation between the forking indices (sorted by importance (magnitude of the drift)) and most counterfactually important units(sentences) on the same set of 3 problems.
+- 2) integrate bayesian CPD to infer the forking indices
     - use the obtained forking indices as decompositions boundaries and apply thought anchors black box attribution method on such a decomposition, automatically label each unit (LLM-based functional labeling) and compare with the results obtained in the thought anchors paper
-- 2) compute the degree of overlap/correlation between the forking indices (sorted by importance (magnitude of the drift)) and most counterfactually important units(sentences) on the same set of 3 problems.
 
 - consider ways to reduce the costs of the forking paths approach
 

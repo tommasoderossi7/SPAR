@@ -104,3 +104,45 @@ Here is the full Chain of Thought, broken into chunks:
 
 Now label each chunk with function tags and dependencies.
 """
+
+# Create a prompt to get a concise summary
+SUMMARY_PROMPT = """
+Please provide a 2-4 word maximum summary of what specifically happens in this text chunk. Focus on the concrete action or calculation, not meta-descriptions like "planning" or "reasoning". 
+
+Examples:
+- "derive x=8" (for solving for a variable)
+- "suggest decimal conversion" (for recommending a calculation approach)
+- "calculate area=45" (for computing an area)
+- "check answer" (for verification)
+- "list possibilities" (for enumeration)
+
+The words should all be lowercase, with the exception of variable names, other proper nouns, or relevant math terms.
+
+Ideally, the summary should be a single sentence that captures the main action or calculation in the chunk.
+- If there is a variable involved, include the variable in the summary.
+- If there is a calculation involved, include the calculation in the summary.
+- If there is a number or value derived from a calculation, include the number or value in the summary.
+
+Text chunk:
+{chunk_text}
+
+Summary (2-4 words max):
+"""
+
+# Create a prompt to get a concise nickname
+NICKNAME_PROMPT = """
+Please provide a 2-4 word maximum nickname for this math problem that captures its essence. Focus on the main mathematical concept or scenario.
+
+Examples:
+- "Page counting" (for problems about counting digits in page numbers)
+- "Coin probability" (for probability problems with coins)
+- "Triangle area" (for geometry problems about triangles)
+- "Modular arithmetic" (for problems involving remainders)
+
+The first word should be capitalized and the rest should be lowercase.
+
+Problem:
+{problem_text}
+
+Nickname (2-4 words max):
+ """
