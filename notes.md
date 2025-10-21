@@ -25,10 +25,14 @@ Next tasks:
     - adapt analyze_rollouts.py to work both on the locally generated data and on the hugging face dataset --- DONE
         - make LLM based labeling work with openrouter and openrouter spar api key
         - how to use the new script generally? which command line arguments do what? How to analyze one single problem?
-    - test generate_rollouts.py
+    - test analyze_rollouts_v3.py
         - execute analyze_rollouts_v3.py on the data (problem_330) coming from hugging face dataset (check below: CALL Thought anchors analyzer of hugging face datasets)
         - testing without any LLM-based labeling
-    - test analyze_rollouts_v3.py
+
+    - take a look at sampled completions from forking paths 
+    - ensure the information saved is sufficient for all later analysis (degree of overlap and threshold based CoT decomposition)
+    - start the full sampling (topk = 10 - minp = 0.05)
+    - test generate_rollouts.py
 
     - compute precise estimation of costs for problem_330 and compare with costs of forking tokens on the same problem
 

@@ -143,6 +143,33 @@ def extract_boxed_answers(text: str) -> List[str]:
     return answers if answers else [""]
 
 
+def normalize_answer(answer: str, use_sympy: bool = False) -> str:
+    """
+    Get the final normalized and cleaned version of an answer.
+    This function combines all normalization steps used in check_answer.
+
+    Args:
+        answer: The answer string to normalize
+        use_sympy: Whether to use sympy to normalize the answer
+
+    Returns:
+        The normalized answer string
+    """
+    # First apply basic LaTeX normalization
+    normalized = normalize_latex(answer)
+
+    # Also prepare the answer for sympy if applicable
+    if use_sympy:
+        try:
+            sympy_ready = prepare_latex_for_sympy(answer)
+            if sympy_ready != normalized and len(sympy_ready) > 0:
+                return sympy_ready
+        except Exception:
+            pass
+
+    return normalized
+
+
 def check_answer(answer: str, gt_answer: str) -> bool:
     """
     Check if the generated answer matches the ground truth answer

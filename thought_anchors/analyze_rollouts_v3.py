@@ -17,6 +17,8 @@ from sentence_transformers import SentenceTransformer
 from utils.utils import (
     normalize_answer,
     split_solution_into_chunks,
+)
+from utils.prompts import (
     DAG_PROMPT,
     NICKNAME_PROMPT,
     SUMMARY_PROMPT,
@@ -26,6 +28,7 @@ import multiprocessing as mp
 from functools import partial
 import scipy.stats as stats
 from matplotlib.lines import Line2D
+import time
 
 
 # ---------------------------
@@ -421,6 +424,13 @@ def materialize_hf_prefix(hf_spec: str, cache_root: Path) -> Optional[Path]:
     """
     try:
         from datasets import load_dataset
+        # DownloadConfig allows us to control retries and timeouts during HF downloads
+        try:
+            # Newer datasets versions
+            from datasets.utils.download_manager import DownloadConfig
+        except Exception:
+            # Older datasets versions
+            from datasets.utils.file_utils import DownloadConfig  # type: ignore
     except ImportError:
         raise RuntimeError("pip install datasets to use HF mode")
 
@@ -433,10 +443,42 @@ def materialize_hf_prefix(hf_spec: str, cache_root: Path) -> Optional[Path]:
     repo = f"{parts[0]}/{parts[1]}"
     prefix = parts[2] if len(parts) > 2 else ""
 
+    # Be lenient with HF Hub timeouts on slow networks
+    os.environ.setdefault("HF_HUB_TIMEOUT", "60")
+    os.environ.setdefault("HF_HUB_READ_TIMEOUT", "60")
+    os.environ.setdefault("HF_HUB_CONNECT_TIMEOUT", "60")
+    os.environ.setdefault("HF_HUB_ETAG_TIMEOUT", "60")
+
     print(f"[HF] Loading dataset {repo} ...")
-    ds = load_dataset(
-        repo, split="train"
-    )  # dataset is a single split with rows as files
+    # Use a generous timeout and retries to avoid ReadTimeouts
+    # Note: DownloadConfig has no 'timeout' parameter; timeouts are controlled via HF_HUB_* env vars.
+    dl_config = DownloadConfig(
+        max_retries=5,
+        resume_download=True,
+        cache_dir=str(cache_root),
+    )
+
+    last_err = None
+    for attempt in range(1, 6):
+        try:
+            ds = load_dataset(
+                repo,
+                split="train",
+                download_config=dl_config,
+                cache_dir=str(cache_root),
+            )  # dataset is a single split with rows as files
+            last_err = None
+            break
+        except Exception as e:
+            last_err = e
+            print(f"[HF] load_dataset failed (attempt {attempt}/5): {e}")
+            # brief backoff before retrying
+            time.sleep(min(2 * attempt, 10))
+    if last_err is not None:
+        # Bubble up with a clearer message
+        raise RuntimeError(
+            f"Failed to load HF dataset '{repo}' after retries. Consider increasing network timeouts or re-running. Last error: {last_err}"
+        )
     # Expected columns include 'path' and 'content' (auto-converted parquet listing)
     # See dataset card for structure. (We rely on 'path' and 'content'.)
 
