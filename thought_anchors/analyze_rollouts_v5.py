@@ -5,7 +5,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 import pandas as pd
 from tqdm import tqdm
 from transformers import AutoTokenizer
@@ -259,6 +259,18 @@ parser.add_argument(
     default=None,
     help="Override HF Hub ETag timeout (seconds)",
 )
+parser.add_argument(
+    "--hf_max_workers",
+    type=int,
+    default=4,
+    help="Max parallel HTTP workers for snapshot_download (lower it if you hit resolver rate limits).",
+)
+parser.add_argument(
+    "--hf_rate_limit_backoff_cap",
+    type=int,
+    default=300,
+    help="Upper bound (seconds) to sleep when RateLimit headers are missing.",
+)
 
 args = parser.parse_args()
 
@@ -448,6 +460,45 @@ if hf_token:
         print(f"[HF] Token login failed (continuing): {e}")
 
 
+def _extract_wait_seconds(exc, default_seconds: int = 20) -> int:
+    """
+    Read 429 headers from HF Hub responses and compute how long to wait.
+    Prefers IETF RateLimit headers (`t=<seconds>`), falls back to Retry-After.
+    """
+    wait = default_seconds
+    resp = getattr(exc, "response", None)
+    headers = {}
+    if resp is not None and hasattr(resp, "headers") and resp.headers:
+        headers = resp.headers
+        # Retry-After (standard)
+        ra = headers.get("Retry-After")
+        if ra:
+            try:
+                wait = max(wait, int(ra))
+            except Exception:
+                pass
+        # IETF RateLimit header: e.g. "resolvers";w=300;limit=5000;remaining=0;reset=172;policy="resolvers"; r=0; t=172
+        rl = headers.get("RateLimit") or headers.get("X-RateLimit-Reset")
+        if isinstance(rl, str):
+            m = re.search(r"[;,\s]t=(\d+)", rl)
+            if m:
+                wait = max(wait, int(m.group(1)))
+    else:
+        # Some exceptions stringify the header blob; try a last-ditch regex
+        m = re.search(r"[;,\s]t=(\d+)", str(exc))
+        if m:
+            wait = max(wait, int(m.group(1)))
+    return min(wait, int(args.hf_rate_limit_backoff_cap))
+
+
+def _status_code(exc) -> Optional[int]:
+    resp = getattr(exc, "response", None)
+    try:
+        return getattr(resp, "status_code", None)
+    except Exception:
+        return None
+
+
 def is_hf_spec(path_or_hf: Optional[str]) -> bool:
     return isinstance(path_or_hf, str) and path_or_hf.startswith("hf://")
 
@@ -503,6 +554,57 @@ def _reset_hf_http_session() -> None:
         pass
 
 
+def try_snapshot(
+    patterns: List[str],
+    repo: str,
+    cache_root: Path,
+    prefix: str,
+    attempt: int,
+    workers: int,
+) -> Tuple[Optional[Path], int]:
+    """
+    One attempt at downloading a subset with backoff/jitter and rate-limit handling.
+    Returns (out_path_or_None, possibly_adjusted_workers).
+    """
+    try:
+        repo_dir = snapshot_download(
+            repo_id=repo,  # e.g. "uzaymacar/math-rollouts"
+            repo_type="dataset",
+            local_dir=str(cache_root),
+            local_dir_use_symlinks=False,
+            resume_download=True,
+            # >>> Use the patterns we were asked to fetch:
+            allow_patterns=patterns
+            if patterns
+            else ([f"{prefix}/*"] if prefix else None),
+            max_workers=workers,
+        )
+        out_base = Path(repo_dir) / prefix if prefix else Path(repo_dir)
+        return (out_base if out_base.exists() else None, workers)
+    except Exception as e:
+        code = _status_code(e)
+        # Respect Hub's RateLimit headers exactly on 429
+        if code == 429:
+            wait = _extract_wait_seconds(e, default_seconds=20) + random.uniform(0, 1.5)
+            new_workers = max(1, workers // 2)
+            print(
+                f"[HF] Rate limited (429). Sleeping {wait:.1f}s. Reducing max_workers {workers} -> {new_workers}"
+            )
+            time.sleep(wait)
+            return (None, new_workers)
+        # Generic network/backoff for 5xx or other transient errors
+        if code in (500, 502, 503, 504) or code is None:
+            wait = min(60, 2**attempt) + random.uniform(0, 1.5)
+            print(
+                f"[HF] snapshot_download failed (attempt {attempt}): {e} -> backoff {wait:.1f}s"
+            )
+            time.sleep(wait)
+            return (None, workers)
+        # Non-retryable
+        print(f"[HF] snapshot_download failed (non-retryable): {e}")
+        return (None, workers)
+
+
 def materialize_hf_prefix(hf_spec: str, cache_root: Path) -> Optional[Path]:
     """
     Prefer robust subtree download via huggingface_hub.snapshot_download with allow_patterns,
@@ -540,33 +642,17 @@ def materialize_hf_prefix(hf_spec: str, cache_root: Path) -> Optional[Path]:
     local_dir = cache_root / "hf_snapshots" / repo.replace("/", "__")
     local_dir.mkdir(parents=True, exist_ok=True)
 
-    def try_snapshot(patterns: List[str], attempt: int) -> Optional[Path]:
-        """One attempt at downloading a subset with backoff/jitter."""
-        try:
-            repo_dir = snapshot_download(
-                repo_id=repo,  # e.g. "uzaymacar/math-rollouts"
-                repo_type="dataset",  # <<< IMPORTANT
-                local_dir=str(cache_root),  # materialize into your cache folder
-                local_dir_use_symlinks=False,
-                resume_download=True,
-                allow_patterns=[f"{prefix}/*"]
-                if prefix
-                else None,  # only needed subtree
-                max_workers=8,
-            )
-            out_base = Path(repo_dir) / prefix if prefix else Path(repo_dir)
-            return out_base if out_base.exists() else None
-        except Exception as e:
-            wait = min(60, 2**attempt) + random.uniform(0, 1.5)
-            print(
-                f"[HF] snapshot_download failed (attempt {attempt}): {e} -> backoff {wait:.1f}s"
-            )
-            time.sleep(wait)
-            return None
-
     # --- Phase 1: a single snapshot with (possibly narrowed) allow_patterns ---
-    for attempt in range(1, 4):
-        out = try_snapshot(allow_patterns, attempt)
+    workers = int(args.hf_max_workers)
+    for attempt in range(1, 6):
+        out, workers = try_snapshot(
+            allow_patterns,
+            repo=repo,
+            cache_root=cache_root,
+            prefix=prefix,
+            attempt=attempt,
+            workers=workers,
+        )
         if out:
             print(f"[HF] Snapshot materialized to {out}")
             return out
@@ -606,16 +692,23 @@ def materialize_hf_prefix(hf_spec: str, cache_root: Path) -> Optional[Path]:
         # Download in batches of N problems per call to reduce server load
         keys = sorted(groups.keys())
         batch_size = 10
+        workers = int(args.hf_max_workers)
         for i in range(0, len(keys), batch_size):
             batch_keys = keys[i : i + batch_size]
-            # allow patterns can be exact file paths too; pass them directly
-            batch_patterns = []
-            for k in batch_keys:
-                # Prefer directory wildcards; if empty, fall back to each file
-                batch_patterns.append(f"{prefix}/{k}/*")
-            # attempt with a few retries for this batch
-            for attempt in range(1, 4):
-                out = try_snapshot(batch_patterns, attempt)
+            batch_patterns = (
+                [f"{prefix}/{k}/*" for k in batch_keys]
+                if prefix
+                else [f"{k}/*" for k in batch_keys]
+            )
+            for attempt in range(1, 6):
+                out, workers = try_snapshot(
+                    batch_patterns,
+                    repo=repo,
+                    cache_root=cache_root,
+                    prefix=prefix,
+                    attempt=attempt,
+                    workers=workers,
+                )
                 if out:
                     break
             else:

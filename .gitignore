@@ -4,3 +4,5 @@ tmp/
 math_rollouts/
 __pycache__/
 .env
+.cache/
+analysis/

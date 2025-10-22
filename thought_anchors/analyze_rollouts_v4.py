@@ -29,8 +29,6 @@ from functools import partial
 import scipy.stats as stats
 from matplotlib.lines import Line2D
 import time
-from huggingface_hub import snapshot_download, HfApi, list_repo_files, login
-import random
 
 
 # ---------------------------
@@ -438,16 +436,6 @@ def count_tokens(text: str, approximate: bool = True) -> int:
 # ---------------------------
 # HF materializer
 # ---------------------------
-
-hf_token = os.getenv("HUGGINGFACE_HUB_TOKEN") or os.getenv("HF_TOKEN")
-if hf_token:
-    try:
-        login(token=hf_token)
-        print("[HF] Logged in via token from env")
-    except Exception as e:
-        print(f"[HF] Token login failed (continuing): {e}")
-
-
 def is_hf_spec(path_or_hf: Optional[str]) -> bool:
     return isinstance(path_or_hf, str) and path_or_hf.startswith("hf://")
 
@@ -505,10 +493,24 @@ def _reset_hf_http_session() -> None:
 
 def materialize_hf_prefix(hf_spec: str, cache_root: Path) -> Optional[Path]:
     """
-    Prefer robust subtree download via huggingface_hub.snapshot_download with allow_patterns,
-    then (if needed) chunked per-problem pulls, and *only then* fall back to datasets.load_dataset.
+    hf_spec format:
+      hf://uzaymacar/math-rollouts/<prefix/path/from/dataset/root>
+    Example:
+      hf://uzaymacar/math-rollouts/deepseek-r1-distill-qwen-14b/temperature_0.6_top_p_0.95/correct_base_solution
+    This will write all dataset rows whose 'path' startswith that prefix to cache_root/<prefix>/...
     """
-    # --- Parse spec ---
+    try:
+        from datasets import load_dataset
+        # DownloadConfig allows us to control retries and timeouts during HF downloads
+        try:
+            # Newer datasets versions
+            from datasets.utils.download_manager import DownloadConfig
+        except Exception:
+            # Older datasets versions
+            from datasets.utils.file_utils import DownloadConfig  # type: ignore
+    except ImportError:
+        raise RuntimeError("pip install datasets to use HF mode")
+
     assert hf_spec.startswith("hf://")
     parts = hf_spec[len("hf://") :].split("/", 2)
     if len(parts) < 2:
@@ -518,134 +520,29 @@ def materialize_hf_prefix(hf_spec: str, cache_root: Path) -> Optional[Path]:
     repo = f"{parts[0]}/{parts[1]}"
     prefix = parts[2] if len(parts) > 2 else ""
 
-    # --- Make Hub more tolerant on slow networks ---
-    os.environ.setdefault(
-        "HF_HUB_DOWNLOAD_TIMEOUT", "300"
-    )  # doc: increase overall download timeout
-    os.environ.setdefault("HF_HUB_ETAG_TIMEOUT", "300")  # doc: increase etag timeout
-    # Optional acceleration if hf_transfer is installed; harmless if not
-    os.environ.setdefault(
-        "HF_HUB_ENABLE_HF_TRANSFER", "1"
-    )  # doc: enable fast transfer if available
+    # Be lenient with HF Hub timeouts on slow networks.
+    # Also force-reset HF HTTP session so the new timeouts take effect.
+    _bump_hf_timeouts(120)
+    _reset_hf_http_session()
 
-    # Derive allow_patterns (narrow if --problems was provided)
-    allow_patterns: List[str]
-    if getattr(args, "problems", None):
-        chosen = [p.strip() for p in str(args.problems).split(",") if p.strip()]
-        allow_patterns = [f"{prefix}/problem_{pid}/*" for pid in chosen]
-    else:
-        allow_patterns = [f"{prefix}/*"] if prefix else ["*"]
+    print(f"[HF] Loading dataset {repo} ...")
+    # Use a generous timeout and retries to avoid ReadTimeouts
+    # Note: DownloadConfig has no 'timeout' parameter; timeouts are controlled via HF_HUB_* env vars.
+    dl_config = DownloadConfig(
+        max_retries=5,
+        resume_download=True,
+        cache_dir=str(cache_root),
+    )
 
-    # Keep everything under one deterministic local dir
-    local_dir = cache_root / "hf_snapshots" / repo.replace("/", "__")
-    local_dir.mkdir(parents=True, exist_ok=True)
-
-    def try_snapshot(patterns: List[str], attempt: int) -> Optional[Path]:
-        """One attempt at downloading a subset with backoff/jitter."""
+    # Try streaming first to avoid full dataset materialization (more resilient and memory-light)
+    iterable = None
+    stream_err = None
+    # Multiple tries with increasing timeouts and backoff
+    stream_timeouts = [120, 240, 360]
+    for i, tout in enumerate(stream_timeouts, start=1):
         try:
-            repo_dir = snapshot_download(
-                repo_id=repo,  # e.g. "uzaymacar/math-rollouts"
-                repo_type="dataset",  # <<< IMPORTANT
-                local_dir=str(cache_root),  # materialize into your cache folder
-                local_dir_use_symlinks=False,
-                resume_download=True,
-                allow_patterns=[f"{prefix}/*"]
-                if prefix
-                else None,  # only needed subtree
-                max_workers=8,
-            )
-            out_base = Path(repo_dir) / prefix if prefix else Path(repo_dir)
-            return out_base if out_base.exists() else None
-        except Exception as e:
-            wait = min(60, 2**attempt) + random.uniform(0, 1.5)
-            print(
-                f"[HF] snapshot_download failed (attempt {attempt}): {e} -> backoff {wait:.1f}s"
-            )
-            time.sleep(wait)
-            return None
-
-    # --- Phase 1: a single snapshot with (possibly narrowed) allow_patterns ---
-    for attempt in range(1, 4):
-        out = try_snapshot(allow_patterns, attempt)
-        if out:
-            print(f"[HF] Snapshot materialized to {out}")
-            return out
-
-    # --- Phase 2: chunked per-problem snapshots (smaller allow sets) ---
-    # List files and group them by top-level problem directories, then fetch in small batches.
-    try:
-        api = HfApi()
-        print("[HF] Enumerating repository files to chunk downloads...")
-        files = api.list_repo_files(
-            repo_id=repo, repo_type="dataset"
-        )  # may be a few seconds on big repos
-        # Filter to our prefix
-        files = [p for p in files if p.startswith(prefix)]
-        # Group by "problem_xxx"
-        groups = {}
-        for p in files:
-            # expect .../<prefix>/problem_####/...
-            parts_p = p.split("/")
-            try:
-                # find the first segment starting with 'problem_'
-                prob = next(seg for seg in parts_p if seg.startswith("problem_"))
-            except StopIteration:
-                prob = None
-            if prob:
-                groups.setdefault(prob, []).append(p)
-
-        # If the user narrowed --problems, keep only those groups
-        if getattr(args, "problems", None):
-            keep = set(
-                f"problem_{p.strip()}"
-                for p in str(args.problems).split(",")
-                if p.strip()
-            )
-            groups = {k: v for k, v in groups.items() if k in keep}
-
-        # Download in batches of N problems per call to reduce server load
-        keys = sorted(groups.keys())
-        batch_size = 10
-        for i in range(0, len(keys), batch_size):
-            batch_keys = keys[i : i + batch_size]
-            # allow patterns can be exact file paths too; pass them directly
-            batch_patterns = []
-            for k in batch_keys:
-                # Prefer directory wildcards; if empty, fall back to each file
-                batch_patterns.append(f"{prefix}/{k}/*")
-            # attempt with a few retries for this batch
-            for attempt in range(1, 4):
-                out = try_snapshot(batch_patterns, attempt)
-                if out:
-                    break
-            else:
-                print(f"[HF] Batch {batch_keys} failed after retries, continuing...")
-
-        out_base = local_dir / prefix if prefix else local_dir
-        if out_base.exists():
-            print(f"[HF] Chunked snapshot materialized to {out_base}")
-            return out_base
-    except Exception as e:
-        print(f"[HF] Chunked snapshot fallback failed: {e}")
-
-    # --- Phase 3: LAST RESORT — your original datasets.load_dataset materializer ---
-    try:
-        from datasets import load_dataset
-
-        try:
-            from datasets.utils.download_manager import DownloadConfig
-        except Exception:
-            from datasets.utils.file_utils import DownloadConfig  # older datasets
-        print(
-            f"[HF] Falling back to datasets.load_dataset for {repo} (this is slower/fragile)"
-        )
-        dl_config = DownloadConfig(
-            max_retries=8, resume_download=True, cache_dir=str(cache_root)
-        )
-
-        # Try streaming first (may still timeout); then non-streaming with retries
-        iterable = None
-        try:
+            _bump_hf_timeouts(tout)
+            _reset_hf_http_session()
             iterable = load_dataset(
                 repo,
                 split="train",
@@ -653,82 +550,111 @@ def materialize_hf_prefix(hf_spec: str, cache_root: Path) -> Optional[Path]:
                 download_config=dl_config,
                 cache_dir=str(cache_root),
             )
+            stream_err = None
+            break
         except Exception as e:
-            print(f"[HF] Streaming load failed: {e}")
+            stream_err = e
+            print(f"[HF] Streaming load failed (attempt {i}/{len(stream_timeouts)}): {e}")
+            time.sleep(min(5 * i, 15))
+    if iterable is None:
+        print("[HF] Streaming could not be established; falling back to regular load with retries.")
 
-        if iterable is None:
-            last_err = None
-            for attempt in range(1, 6):
-                try:
-                    iterable = load_dataset(
-                        repo,
-                        split="train",
-                        download_config=dl_config,
-                        cache_dir=str(cache_root),
-                    )
-                    last_err = None
-                    break
-                except Exception as e:
-                    last_err = e
-                    print(f"[HF] load_dataset failed (attempt {attempt}/5): {e}")
-                    time.sleep(min(10, 2 * attempt))
-            if last_err is not None:
-                raise RuntimeError(f"Failed to load HF dataset '{repo}': {last_err}")
+    if iterable is None:
+        last_err = None
+        for attempt in range(1, 6):
+            try:
+                # increase timeouts for each attempt
+                _bump_hf_timeouts(120 + attempt * 60)
+                _reset_hf_http_session()
+                iterable = load_dataset(
+                    repo,
+                    split="train",
+                    download_config=dl_config,
+                    cache_dir=str(cache_root),
+                    download_mode="reuse_cache_if_exists",
+                )  # dataset is a single split with rows as files
+                last_err = None
+                break
+            except Exception as e:
+                last_err = e
+                print(f"[HF] load_dataset failed (attempt {attempt}/5): {e}")
+                # exponential backoff with jitter
+                time.sleep(min(4 ** attempt + np.random.rand() * 2, 60))
+        if last_err is not None:
+            # Bubble up with a clearer message
+            raise RuntimeError(
+                f"Failed to load HF dataset '{repo}' after retries. Last error: {last_err}. Streaming error: {stream_err}"
+            )
+    # Expected columns include 'path' and 'content' (auto-converted parquet listing)
+    # See dataset card for structure. (We rely on 'path' and 'content'.)
 
-        out_base = cache_root / prefix
-        out_base.mkdir(parents=True, exist_ok=True)
+    out_base = cache_root / prefix
+    out_base.mkdir(parents=True, exist_ok=True)
 
-        # Write rows selectively (only our prefix)
+    print(f"[HF] Materializing files with prefix '{prefix}' into {out_base} ...")
+    # Iterate & write progressively; skip files that already exist to allow resume
+    count = 0
+    skipped = 0
+    errors = 0
+
+    def _write_atomic_text(path: Path, data: str):
+        tmp = path.with_suffix(path.suffix + ".partial")
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(data)
+        os.replace(tmp, path)
+
+    try:
+        # If non-streaming, we might have a length for tqdm
         try:
             total_len = len(iterable)
             it = tqdm(iterable, total=total_len)
         except Exception:
             it = tqdm(iterable)
 
-        def _write_atomic_text(path: Path, data: str):
-            tmp = path.with_suffix(path.suffix + ".partial")
-            with open(tmp, "w", encoding="utf-8") as f:
-                f.write(data)
-            os.replace(tmp, path)
-
-        count = skipped = errors = 0
         for row in it:
-            p = (
-                (row.get("path") or row.get("repo_path") or "")
-                if isinstance(row, dict)
-                else ""
-            )
-            if not p or (prefix and not p.startswith(prefix)):
-                continue
-            target_path = cache_root / p
-            if target_path.exists():
-                skipped += 1
-                continue
-            target_path.parent.mkdir(parents=True, exist_ok=True)
-            content = row.get("content", "") if isinstance(row, dict) else ""
             try:
+                # Extract path string
+                try:
+                    p = row.get("path") or row.get("repo_path") or ""
+                except AttributeError:
+                    p = row["path"] if isinstance(row, dict) and "path" in row else ""
+                if not isinstance(p, str) or not p:
+                    continue
+                if prefix and not p.startswith(prefix):
+                    continue
+
+                target_path = cache_root / p
+                if target_path.exists():
+                    skipped += 1
+                    continue
+
+                target_path.parent.mkdir(parents=True, exist_ok=True)
+
+                content = ""
+                if isinstance(row, dict):
+                    content = row.get("content", "")
+                if content is None:
+                    content = ""
+
                 if isinstance(content, bytes):
                     tmp = target_path.with_suffix(target_path.suffix + ".partial")
                     with open(tmp, "wb") as f:
                         f.write(content)
                     os.replace(tmp, target_path)
                 else:
-                    _write_atomic_text(
-                        target_path,
-                        content if isinstance(content, str) else str(content),
-                    )
+                    _write_atomic_text(target_path, content if isinstance(content, str) else str(content))
                 count += 1
             except Exception as e:
                 errors += 1
-                print(f"[HF] Error writing {target_path}: {e}")
-        print(
-            f"[HF] Wrote {count} files. Skipped existing: {skipped}. Errors: {errors}."
-        )
-        return out_base
+                print(f"[HF] Error writing row: {e}")
     except Exception as e:
-        raise RuntimeError(
-            f"All HF download strategies failed for '{repo}/{prefix}': {e}"
-        )
+        print(f"[HF] Iteration over dataset interrupted: {e}")
+
+    if count == 0 and skipped == 0:
+        print(f"[HF] No files matched prefix '{prefix}'. Double-check the path.")
+    else:
+        print(f"[HF] Wrote {count} files. Skipped existing: {skipped}. Errors: {errors}.")
+    return out_base
 
 
 def resolve_dir(path_or_hf: Optional[str], cache_root: Path) -> Optional[Path]:
@@ -4177,7 +4103,6 @@ def main():
         if args.hf_timeout_all is not None:
             _bump_hf_timeouts(int(args.hf_timeout_all))
             changed = True
-
         # Apply per-field overrides if provided
         def _set_if(name: str, val: Optional[int]):
             nonlocal changed

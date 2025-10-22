@@ -26,8 +26,10 @@ Next tasks:
         - make LLM based labeling work with openrouter and openrouter spar api key
         - how to use the new script generally? which command line arguments do what? How to analyze one single problem?
     - test analyze_rollouts_v3.py
-        - execute analyze_rollouts_v3.py on the data (problem_330) coming from hugging face dataset (check below: CALL Thought anchors analyzer of hugging face datasets)
-        - testing without any LLM-based labeling
+        - execute analyze_rollouts_v3.py on the data (problem_330) coming from hugging face dataset (check below: CALL Thought anchors analyzer of hugging face datasets) --- DONE
+        - testing without any LLM-based labeling --- DONE
+        - run v5 and handle the too many requests rate limit --- DONE
+        - navigate the results
 
     - take a look at sampled completions from forking paths 
     - ensure the information saved is sufficient for all later analysis (degree of overlap and threshold based CoT decomposition)
@@ -62,13 +64,7 @@ Substring to match
 3(1+3(1+3(1+3(1+3(1+3(1+3(1+3(1+3(1+3)))))))))
 
 CALL Thought anchors analyzer of hugging face datasets
-python -m thought_anchors.analyze_rollouts_v3 \
-  --correct_rollouts_dir hf://uzaymacar/math-rollouts/deepseek-r1-distill-qwen-14b/temperature_0.6_top_p_0.95/correct_base_solution \
-  --incorrect_rollouts_dir hf://uzaymacar/math-rollouts/deepseek-r1-distill-qwen-14b/temperature_0.6_top_p_0.95/incorrect_base_solution \
-  --llm_provider none \
-  --importance_metric counterfactual_importance_accuracy \
-  --use_existing_metrics \
-  --problems "330"
+python -m thought_anchors.analyze_rollouts_v5  --correct_rollouts_dir hf://uzaymacar/math-rollouts/deepseek-r1-distill-qwen-14b/temperature_0.6_top_p_0.95/correct_base_solution  --incorrect_rollouts_dir hf://uzaymacar/math-rollouts/deepseek-r1-distill-qwen-14b/temperature_0.6_top_p_0.95/incorrect_base_solution  --llm_provider none  --importance_metric counterfactual_importance_accuracy  --use_existing_metrics  --problems "330"
 
 
 
