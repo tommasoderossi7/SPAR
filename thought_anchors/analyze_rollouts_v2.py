@@ -5,7 +5,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 import pandas as pd
 from tqdm import tqdm
 from transformers import AutoTokenizer
@@ -14,12 +14,23 @@ from dotenv import load_dotenv
 import re
 from collections import Counter, defaultdict
 from sentence_transformers import SentenceTransformer
-from utils.utils import normalize_answer, split_solution_into_chunks, DAG_PROMPT
+from utils.utils import (
+    normalize_answer,
+    split_solution_into_chunks,
+)
+from utils.prompts import (
+    DAG_PROMPT,
+    NICKNAME_PROMPT,
+    SUMMARY_PROMPT,
+)
 import math
 import multiprocessing as mp
 from functools import partial
 import scipy.stats as stats
 from matplotlib.lines import Line2D
+import time
+from huggingface_hub import snapshot_download, HfApi, list_repo_files, login
+import random
 
 
 # ---------------------------
@@ -69,7 +80,7 @@ parser.add_argument(
     "-o",
     "--output_dir",
     type=str,
-    default="analysis/basic",
+    default="thought_anchors/analysis/basic",
     help="Directory to save analysis",
 )
 parser.add_argument(
@@ -193,40 +204,72 @@ parser.add_argument(
     "-pt",
     "--use_prob_true",
     default=False,
-    action="store_false",
+    action="store_true",
     help="Use P(true) for KL instead of answer distribution",
 )
 # New: HF + Novita knobs
 parser.add_argument(
     "--hf_cache_dir",
     type=str,
-    default=".cache/math_rollouts_hf",
+    default="thought_anchors/.cache/math_rollouts_hf",
     help="Local cache dir for HF materialized files",
 )
 parser.add_argument(
     "--llm_provider",
     type=str,
-    default="novita",
-    choices=["novita", "none"],
+    default="openrouter",
+    choices=["openrouter", "none"],
     help="Provider for small metadata generations (nicknames, chunk summaries, DAG). 'none' skips.",
 )
 parser.add_argument(
     "--llm_model",
     type=str,
-    default="deepseek/deepseek-r1-distill-qwen-14b",
-    help="LLM model to use on Novita for summaries/labels",
-)
-parser.add_argument(
-    "--novita_api_base",
-    type=str,
-    default="https://api.novita.ai/v3/openai/completions",
-    help="Novita OpenAI-compatible completions endpoint",
+    default="openai/gpt-4o-mini",
+    help="LLM model to use on OpenRouter for summaries/labels",
 )
 parser.add_argument(
     "--llm_temperature", type=float, default=0.0, help="Temperature for metadata calls"
 )
 parser.add_argument(
-    "--llm_max_tokens", type=int, default=128, help="Max tokens for metadata calls"
+    "--llm_max_tokens", type=int, default=20, help="Max tokens for metadata calls"
+)
+
+# HF Hub timeout overrides (optional)
+parser.add_argument(
+    "--hf_timeout_all",
+    type=int,
+    default=None,
+    help="Set all HF Hub timeouts (read/connect/etag/general) to at least this many seconds",
+)
+parser.add_argument(
+    "--hf_read_timeout",
+    type=int,
+    default=None,
+    help="Override HF Hub read timeout (seconds)",
+)
+parser.add_argument(
+    "--hf_connect_timeout",
+    type=int,
+    default=None,
+    help="Override HF Hub connect timeout (seconds)",
+)
+parser.add_argument(
+    "--hf_etag_timeout",
+    type=int,
+    default=None,
+    help="Override HF Hub ETag timeout (seconds)",
+)
+parser.add_argument(
+    "--hf_max_workers",
+    type=int,
+    default=4,
+    help="Max parallel HTTP workers for snapshot_download (lower it if you hit resolver rate limits).",
+)
+parser.add_argument(
+    "--hf_rate_limit_backoff_cap",
+    type=int,
+    default=300,
+    help="Upper bound (seconds) to sleep when RateLimit headers are missing.",
 )
 
 args = parser.parse_args()
@@ -234,6 +277,7 @@ args = parser.parse_args()
 # ---------------------------
 # Global config / style
 # ---------------------------
+
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 FONT_SIZE = 20
@@ -258,12 +302,26 @@ FIGSIZE = (20, 7)
 # Env / tokenizer
 # ---------------------------
 load_dotenv()
-NOVITA_API_KEY = os.getenv("NOVITA_API_KEY")
 
-if args.llm_provider == "novita" and not NOVITA_API_KEY:
-    raise ValueError(
-        "NOVITA_API_KEY not found. Set it or run with --llm_provider none."
+if args.llm_provider == "openrouter":
+    OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY_SPAR") or os.getenv(
+        "OPENROUTER_API_KEY"
     )
+    if not OPENROUTER_API_KEY:
+        raise ValueError(
+            "OPENROUTER_API_KEY_SPAR (or OPENROUTER_API_KEY) not found in .env"
+        )
+
+    client = OpenAI(
+        base_url="https://openrouter.ai/api/v1",
+        api_key=OPENROUTER_API_KEY,
+        # These are optional but recommended by OpenRouter
+        default_headers={
+            "HTTP-Referer": os.getenv("OPENROUTER_HTTP_REFERER", "https://local"),
+            "X-Title": os.getenv("OPENROUTER_X_TITLE", "Math Rollouts Analysis"),
+        },
+    )
+
 
 # Tokenizer for token counts (same as in paper’s models list)
 # (deepseek R1-distill qwen-14b)
@@ -368,96 +426,6 @@ stopwords = {
 }
 
 
-# ---------------------------
-# Novita LLM helpers (OpenAI-compatible completions)
-# ---------------------------
-def novita_complete(
-    prompt: str, temperature: float = None, max_tokens: int = None, model: str = None
-) -> str:
-    """Minimal wrapper for Novita /completions endpoint (non-stream)."""
-    if args.llm_provider == "none":
-        return ""
-
-    headers = {
-        "Authorization": f"Bearer {NOVITA_API_KEY}",
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "model": model or args.llm_model,
-        "prompt": prompt,
-        "temperature": args.llm_temperature if temperature is None else temperature,
-        "top_p": 0.95,
-        "max_tokens": args.llm_max_tokens if max_tokens is None else max_tokens,
-        "stream": False,
-        "n": 1,
-    }
-    # backoff retries
-    delay = 2.0
-    for attempt in range(4):
-        try:
-            with httpx.Client(timeout=60) as client:
-                r = client.post(args.novita_api_base, headers=headers, json=payload)
-                if r.status_code == 200:
-                    data = r.json()
-                    return data["choices"][0]["text"]
-                elif r.status_code in (429, 500, 502, 503):
-                    time.sleep(delay * (2**attempt))
-                else:
-                    print(f"[Novita] Error {r.status_code}: {r.text}")
-                    break
-        except Exception as e:
-            print(f"[Novita] Exception: {e}")
-            time.sleep(delay * (2**attempt))
-    return ""
-
-
-# ---------------------------
-# Lightweight prompts (embedded)
-# ---------------------------
-DAG_PROMPT = """You are labeling reasoning steps (chunks) from a math solution.
-
-Task:
-Given the problem statement and the list of numbered chunks (Chunk i: <text>),
-assign for EACH chunk:
-  - function_tags: a small list of snake_case tags (e.g., planning_step, fact_retrieval, equation_setup, algebraic_transformation, numeric_computation, verification, final_answer, dead_end, irrelevant).
-  - depends_on: list of prior chunk indices this chunk depends on (strings of indices; e.g., ["0","3"]).
-
-Output STRICT JSON with keys "chunks": an object whose keys are the chunk indices ("0","1","2",...) and values are objects of the form:
-  { "function_tags": [...], "depends_on": [...] }
-
-Example:
-{
-  "chunks": {
-    "0": {"function_tags": ["planning_step"], "depends_on": []},
-    "1": {"function_tags": ["equation_setup"], "depends_on": ["0"]},
-    "2": {"function_tags": ["numeric_computation"], "depends_on": ["1"]}
-  }
-}
-
-Problem:
-{problem_text}
-
-Chunks:
-{full_chunked_text}
-
-Return ONLY the JSON object.
-"""
-
-SUMMARY_PROMPT_TMPL = """Provide a concise 2–4 word summary describing the concrete action or calculation in this text.
-Use lowercase words except variable names or proper math terms. Avoid meta words like "planning" or "reasoning".
-Text:
-{chunk}
-
-Summary:"""
-
-NICKNAME_PROMPT_TMPL = """Give a 2–4 word nickname for this math problem capturing the main concept or scenario.
-Capitalize the first word only.
-Problem:
-{problem}
-
-Nickname:"""
-
-
 def safe_json_parse(text: str) -> Optional[dict]:
     text = text.strip()
     # try to extract JSON substring if model added extra text
@@ -482,23 +450,167 @@ def count_tokens(text: str, approximate: bool = True) -> int:
 # ---------------------------
 # HF materializer
 # ---------------------------
+
+hf_token = os.getenv("HUGGINGFACE_HUB_TOKEN") or os.getenv("HF_TOKEN")
+if hf_token:
+    try:
+        login(token=hf_token)
+        print("[HF] Logged in via token from env")
+    except Exception as e:
+        print(f"[HF] Token login failed (continuing): {e}")
+
+
+def _extract_wait_seconds(exc, default_seconds: int = 20) -> int:
+    """
+    Read 429 headers from HF Hub responses and compute how long to wait.
+    Prefers IETF RateLimit headers (`t=<seconds>`), falls back to Retry-After.
+    """
+    wait = default_seconds
+    resp = getattr(exc, "response", None)
+    headers = {}
+    if resp is not None and hasattr(resp, "headers") and resp.headers:
+        headers = resp.headers
+        # Retry-After (standard)
+        ra = headers.get("Retry-After")
+        if ra:
+            try:
+                wait = max(wait, int(ra))
+            except Exception:
+                pass
+        # IETF RateLimit header: e.g. "resolvers";w=300;limit=5000;remaining=0;reset=172;policy="resolvers"; r=0; t=172
+        rl = headers.get("RateLimit") or headers.get("X-RateLimit-Reset")
+        if isinstance(rl, str):
+            m = re.search(r"[;,\s]t=(\d+)", rl)
+            if m:
+                wait = max(wait, int(m.group(1)))
+    else:
+        # Some exceptions stringify the header blob; try a last-ditch regex
+        m = re.search(r"[;,\s]t=(\d+)", str(exc))
+        if m:
+            wait = max(wait, int(m.group(1)))
+    return min(wait, int(args.hf_rate_limit_backoff_cap))
+
+
+def _status_code(exc) -> Optional[int]:
+    resp = getattr(exc, "response", None)
+    try:
+        return getattr(resp, "status_code", None)
+    except Exception:
+        return None
+
+
 def is_hf_spec(path_or_hf: Optional[str]) -> bool:
     return isinstance(path_or_hf, str) and path_or_hf.startswith("hf://")
 
 
-def materialize_hf_prefix(hf_spec: str, cache_root: Path) -> Optional[Path]:
+def _bump_hf_timeouts(seconds: int) -> None:
+    # Ensure env variables are set to at least the requested value
+    def _max_int_env(name: str, new_val: int) -> int:
+        try:
+            cur = int(os.environ.get(name, "0"))
+        except Exception:
+            cur = 0
+        val = max(cur, new_val)
+        os.environ[name] = str(val)
+        return val
+
+    t_general = _max_int_env("HF_HUB_TIMEOUT", seconds)
+    t_read = _max_int_env("HF_HUB_READ_TIMEOUT", seconds)
+    t_conn = _max_int_env("HF_HUB_CONNECT_TIMEOUT", seconds)
+    t_etag = _max_int_env("HF_HUB_ETAG_TIMEOUT", seconds)
+
+    # Try to update huggingface_hub constants used at runtime
+    try:
+        from huggingface_hub.utils import constants as hf_constants  # type: ignore
+
+        hf_constants.HF_HUB_TIMEOUT = t_general
+        hf_constants.HF_HUB_READ_TIMEOUT = t_read
+        hf_constants.HF_HUB_CONNECT_TIMEOUT = t_conn
+        hf_constants.HF_HUB_ETAG_TIMEOUT = t_etag
+    except Exception:
+        pass
+
+
+def _reset_hf_http_session() -> None:
+    # Force huggingface_hub to rebuild its requests.Session with new timeouts
+    try:
+        from huggingface_hub.utils import _http as hf_http  # type: ignore
+
+        if hasattr(hf_http, "reset_session"):
+            hf_http.reset_session()  # type: ignore
+        else:
+            # best-effort fallback
+            sess = getattr(hf_http, "_session", None)
+            if sess is not None:
+                try:
+                    sess.close()
+                except Exception:
+                    pass
+                try:
+                    setattr(hf_http, "_session", None)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+
+def try_snapshot(
+    patterns: List[str],
+    repo: str,
+    cache_root: Path,
+    prefix: str,
+    attempt: int,
+    workers: int,
+) -> Tuple[Optional[Path], int]:
     """
-    hf_spec format:
-      hf://uzaymacar/math-rollouts/<prefix/path/from/dataset/root>
-    Example:
-      hf://uzaymacar/math-rollouts/deepseek-r1-distill-qwen-14b/temperature_0.6_top_p_0.95/correct_base_solution
-    This will write all dataset rows whose 'path' startswith that prefix to cache_root/<prefix>/...
+    One attempt at downloading a subset with backoff/jitter and rate-limit handling.
+    Returns (out_path_or_None, possibly_adjusted_workers).
     """
     try:
-        from datasets import load_dataset
-    except ImportError:
-        raise RuntimeError("pip install datasets to use HF mode")
+        repo_dir = snapshot_download(
+            repo_id=repo,  # e.g. "uzaymacar/math-rollouts"
+            repo_type="dataset",
+            local_dir=str(cache_root),
+            local_dir_use_symlinks=False,
+            resume_download=True,
+            # >>> Use the patterns we were asked to fetch:
+            allow_patterns=patterns
+            if patterns
+            else ([f"{prefix}/*"] if prefix else None),
+            max_workers=workers,
+        )
+        out_base = Path(repo_dir) / prefix if prefix else Path(repo_dir)
+        return (out_base if out_base.exists() else None, workers)
+    except Exception as e:
+        code = _status_code(e)
+        # Respect Hub's RateLimit headers exactly on 429
+        if code == 429:
+            wait = _extract_wait_seconds(e, default_seconds=20) + random.uniform(0, 1.5)
+            new_workers = max(1, workers // 2)
+            print(
+                f"[HF] Rate limited (429). Sleeping {wait:.1f}s. Reducing max_workers {workers} -> {new_workers}"
+            )
+            time.sleep(wait)
+            return (None, new_workers)
+        # Generic network/backoff for 5xx or other transient errors
+        if code in (500, 502, 503, 504) or code is None:
+            wait = min(60, 2**attempt) + random.uniform(0, 1.5)
+            print(
+                f"[HF] snapshot_download failed (attempt {attempt}): {e} -> backoff {wait:.1f}s"
+            )
+            time.sleep(wait)
+            return (None, workers)
+        # Non-retryable
+        print(f"[HF] snapshot_download failed (non-retryable): {e}")
+        return (None, workers)
 
+
+def materialize_hf_prefix(hf_spec: str, cache_root: Path) -> Optional[Path]:
+    """
+    Prefer robust subtree download via huggingface_hub.snapshot_download with allow_patterns,
+    then (if needed) chunked per-problem pulls, and *only then* fall back to datasets.load_dataset.
+    """
+    # --- Parse spec ---
     assert hf_spec.startswith("hf://")
     parts = hf_spec[len("hf://") :].split("/", 2)
     if len(parts) < 2:
@@ -508,39 +620,208 @@ def materialize_hf_prefix(hf_spec: str, cache_root: Path) -> Optional[Path]:
     repo = f"{parts[0]}/{parts[1]}"
     prefix = parts[2] if len(parts) > 2 else ""
 
-    print(f"[HF] Loading dataset {repo} ...")
-    ds = load_dataset(
-        repo, split="train"
-    )  # dataset is a single split with rows as files
-    # Expected columns include 'path' and 'content' (auto-converted parquet listing)
-    # See dataset card for structure. (We rely on 'path' and 'content'.)
+    # --- Make Hub more tolerant on slow networks ---
+    os.environ.setdefault(
+        "HF_HUB_DOWNLOAD_TIMEOUT", "300"
+    )  # doc: increase overall download timeout
+    os.environ.setdefault("HF_HUB_ETAG_TIMEOUT", "300")  # doc: increase etag timeout
+    # Optional acceleration if hf_transfer is installed; harmless if not
+    os.environ.setdefault(
+        "HF_HUB_ENABLE_HF_TRANSFER", "1"
+    )  # doc: enable fast transfer if available
 
-    out_base = cache_root / prefix
-    out_base.mkdir(parents=True, exist_ok=True)
-
-    print(f"[HF] Materializing files with prefix '{prefix}' into {out_base} ...")
-    # Iterate & write
-    count = 0
-    for row in tqdm(ds, total=len(ds)):
-        p = row.get("path") or row.get("repo_path") or ""
-        if not isinstance(p, str) or not p:
-            continue
-        if prefix and not p.startswith(prefix):
-            continue
-        # write content
-        content = row.get("content", "")
-        target_path = cache_root / p
-        target_path.parent.mkdir(parents=True, exist_ok=True)
-        # content is already text for json files (per dataset card preview)
-        with open(target_path, "w", encoding="utf-8") as f:
-            f.write(content if isinstance(content, str) else str(content))
-        count += 1
-
-    if count == 0:
-        print(f"[HF] No files matched prefix '{prefix}'. Double-check the path.")
+    # Derive allow_patterns (narrow if --problems was provided)
+    allow_patterns: List[str]
+    if getattr(args, "problems", None):
+        chosen = [p.strip() for p in str(args.problems).split(",") if p.strip()]
+        allow_patterns = [f"{prefix}/problem_{pid}/*" for pid in chosen]
     else:
-        print(f"[HF] Wrote {count} files.")
-    return out_base
+        allow_patterns = [f"{prefix}/*"] if prefix else ["*"]
+
+    # Keep everything under one deterministic local dir
+    local_dir = cache_root / "hf_snapshots" / repo.replace("/", "__")
+    local_dir.mkdir(parents=True, exist_ok=True)
+
+    # --- Phase 1: a single snapshot with (possibly narrowed) allow_patterns ---
+    workers = int(args.hf_max_workers)
+    for attempt in range(1, 6):
+        out, workers = try_snapshot(
+            allow_patterns,
+            repo=repo,
+            cache_root=cache_root,
+            prefix=prefix,
+            attempt=attempt,
+            workers=workers,
+        )
+        if out:
+            print(f"[HF] Snapshot materialized to {out}")
+            return out
+
+    # --- Phase 2: chunked per-problem snapshots (smaller allow sets) ---
+    # List files and group them by top-level problem directories, then fetch in small batches.
+    try:
+        api = HfApi()
+        print("[HF] Enumerating repository files to chunk downloads...")
+        files = api.list_repo_files(
+            repo_id=repo, repo_type="dataset"
+        )  # may be a few seconds on big repos
+        # Filter to our prefix
+        files = [p for p in files if p.startswith(prefix)]
+        # Group by "problem_xxx"
+        groups = {}
+        for p in files:
+            # expect .../<prefix>/problem_####/...
+            parts_p = p.split("/")
+            try:
+                # find the first segment starting with 'problem_'
+                prob = next(seg for seg in parts_p if seg.startswith("problem_"))
+            except StopIteration:
+                prob = None
+            if prob:
+                groups.setdefault(prob, []).append(p)
+
+        # If the user narrowed --problems, keep only those groups
+        if getattr(args, "problems", None):
+            keep = set(
+                f"problem_{p.strip()}"
+                for p in str(args.problems).split(",")
+                if p.strip()
+            )
+            groups = {k: v for k, v in groups.items() if k in keep}
+
+        # Download in batches of N problems per call to reduce server load
+        keys = sorted(groups.keys())
+        batch_size = 10
+        workers = int(args.hf_max_workers)
+        for i in range(0, len(keys), batch_size):
+            batch_keys = keys[i : i + batch_size]
+            batch_patterns = (
+                [f"{prefix}/{k}/*" for k in batch_keys]
+                if prefix
+                else [f"{k}/*" for k in batch_keys]
+            )
+            for attempt in range(1, 6):
+                out, workers = try_snapshot(
+                    batch_patterns,
+                    repo=repo,
+                    cache_root=cache_root,
+                    prefix=prefix,
+                    attempt=attempt,
+                    workers=workers,
+                )
+                if out:
+                    break
+            else:
+                print(f"[HF] Batch {batch_keys} failed after retries, continuing...")
+
+        out_base = local_dir / prefix if prefix else local_dir
+        if out_base.exists():
+            print(f"[HF] Chunked snapshot materialized to {out_base}")
+            return out_base
+    except Exception as e:
+        print(f"[HF] Chunked snapshot fallback failed: {e}")
+
+    # --- Phase 3: LAST RESORT — your original datasets.load_dataset materializer ---
+    try:
+        from datasets import load_dataset
+
+        try:
+            from datasets.utils.download_manager import DownloadConfig
+        except Exception:
+            from datasets.utils.file_utils import DownloadConfig  # older datasets
+        print(
+            f"[HF] Falling back to datasets.load_dataset for {repo} (this is slower/fragile)"
+        )
+        dl_config = DownloadConfig(
+            max_retries=8, resume_download=True, cache_dir=str(cache_root)
+        )
+
+        # Try streaming first (may still timeout); then non-streaming with retries
+        iterable = None
+        try:
+            iterable = load_dataset(
+                repo,
+                split="train",
+                streaming=True,
+                download_config=dl_config,
+                cache_dir=str(cache_root),
+            )
+        except Exception as e:
+            print(f"[HF] Streaming load failed: {e}")
+
+        if iterable is None:
+            last_err = None
+            for attempt in range(1, 6):
+                try:
+                    iterable = load_dataset(
+                        repo,
+                        split="train",
+                        download_config=dl_config,
+                        cache_dir=str(cache_root),
+                    )
+                    last_err = None
+                    break
+                except Exception as e:
+                    last_err = e
+                    print(f"[HF] load_dataset failed (attempt {attempt}/5): {e}")
+                    time.sleep(min(10, 2 * attempt))
+            if last_err is not None:
+                raise RuntimeError(f"Failed to load HF dataset '{repo}': {last_err}")
+
+        out_base = cache_root / prefix
+        out_base.mkdir(parents=True, exist_ok=True)
+
+        # Write rows selectively (only our prefix)
+        try:
+            total_len = len(iterable)
+            it = tqdm(iterable, total=total_len)
+        except Exception:
+            it = tqdm(iterable)
+
+        def _write_atomic_text(path: Path, data: str):
+            tmp = path.with_suffix(path.suffix + ".partial")
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write(data)
+            os.replace(tmp, path)
+
+        count = skipped = errors = 0
+        for row in it:
+            p = (
+                (row.get("path") or row.get("repo_path") or "")
+                if isinstance(row, dict)
+                else ""
+            )
+            if not p or (prefix and not p.startswith(prefix)):
+                continue
+            target_path = cache_root / p
+            if target_path.exists():
+                skipped += 1
+                continue
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            content = row.get("content", "") if isinstance(row, dict) else ""
+            try:
+                if isinstance(content, bytes):
+                    tmp = target_path.with_suffix(target_path.suffix + ".partial")
+                    with open(tmp, "wb") as f:
+                        f.write(content)
+                    os.replace(tmp, target_path)
+                else:
+                    _write_atomic_text(
+                        target_path,
+                        content if isinstance(content, str) else str(content),
+                    )
+                count += 1
+            except Exception as e:
+                errors += 1
+                print(f"[HF] Error writing {target_path}: {e}")
+        print(
+            f"[HF] Wrote {count} files. Skipped existing: {skipped}. Errors: {errors}."
+        )
+        return out_base
+    except Exception as e:
+        raise RuntimeError(
+            f"All HF download strategies failed for '{repo}/{prefix}': {e}"
+        )
 
 
 def resolve_dir(path_or_hf: Optional[str], cache_root: Path) -> Optional[Path]:
@@ -581,20 +862,38 @@ class ImportanceArgs:
 def generate_chunk_summary(chunk_text: str) -> str:
     if args.llm_provider == "none":
         return "unknown action"
-    prompt = SUMMARY_PROMPT_TMPL.format(chunk=chunk_text.strip()[:1200])
-    out = novita_complete(prompt, temperature=0.0, max_tokens=20)
-    # squeeze to <=5 words and strip quotes
-    words = out.strip().replace('"', "").split()
-    return " ".join(words[:5]) if words else "unknown action"
+    prompt = SUMMARY_PROMPT.format(chunk=chunk_text.strip()[:1200])
+    try:
+        resp = client.chat.completions.create(
+            model=args.llm_model,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=args.llm_temperature,
+            max_tokens=args.llm_max_tokens,
+        )
+        summary = resp.choices[0].message.content.strip()
+        # (post-processing unchanged)
+        return " ".join(summary.replace('"', "").split()[:5])
+    except Exception as e:
+        print(f"Error generating chunk summary: {e}")
+        return "unknown action"
 
 
 def generate_problem_nickname(problem_text: str) -> str:
     if args.llm_provider == "none":
         return "math problem"
-    prompt = NICKNAME_PROMPT_TMPL.format(problem=problem_text.strip()[:2000])
-    out = novita_complete(prompt, temperature=0.0, max_tokens=20)
-    words = out.strip().replace('"', "").split()
-    return " ".join(words[:5]) if words else "math problem"
+    prompt = NICKNAME_PROMPT.format(problem=problem_text.strip()[:2000])
+    try:
+        resp = client.chat.completions.create(
+            model=args.llm_model,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=args.llm_temperature,
+            max_tokens=args.llm_max_tokens,
+        )
+        nickname = resp.choices[0].message.content.strip()
+        return " ".join(nickname.replace('"', "").split()[:5])
+    except Exception as e:
+        print(f"Error generating problem nickname: {e}")
+        return "math problem"
 
 
 def dag_label_chunks(problem_text: str, chunks: List[str]) -> Dict[str, Dict]:
@@ -613,10 +912,22 @@ def dag_label_chunks(problem_text: str, chunks: List[str]) -> Dict[str, Dict]:
     prompt = DAG_PROMPT.format(
         problem_text=problem_text, full_chunked_text=full_chunked_text[:6000]
     )
-    out = novita_complete(prompt, temperature=0.0, max_tokens=800)
+    try:
+        resp = client.chat.completions.create(
+            model="openai/gpt-4o",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.0,
+        )
+        out = resp.choices[0].message.content
+    except Exception as e:
+        print(f"Error generating DAG labels: {e}")
+        out = ""
     data = safe_json_parse(out)
     if not data or "chunks" not in data:
         # fallback: unknowns
+        print(
+            "chunks not in DAG response or dag labeling response empty, defaulting to unknown"
+        )
         return {
             "chunks": {
                 str(i): {"function_tags": ["unknown"], "depends_on": []}
@@ -2850,7 +3161,7 @@ def analyze_dag_token_frequencies(dag_dir: Path, output_dir: Path) -> None:
             all_tokens = []
             for chunk in chunks:
                 # Simple tokenization by splitting on whitespace and punctuation
-                tokens = re.findall(r"\b\w+\b", chunk.lower())
+                tokens = re.findall(r"\\b\\w+\\b", chunk.lower())
 
                 # Filter out stopwords and numbers
                 filtered_tokens = [
@@ -2879,7 +3190,7 @@ def analyze_dag_token_frequencies(dag_dir: Path, output_dir: Path) -> None:
                 chunks_with_token = sum(
                     1
                     for chunk in chunks
-                    if re.search(r"\b" + re.escape(token) + r"\b", chunk.lower())
+                    if re.search(r"\\b" + re.escape(token) + r"\\b", chunk.lower())
                 )
                 percentage = (chunks_with_token / total_chunks) * 100
                 token_percentages[token] = percentage
@@ -3024,7 +3335,7 @@ def analyze_token_frequencies(
             all_tokens = []
             for chunk in chunks:
                 # Simple tokenization by splitting on whitespace and punctuation
-                tokens = re.findall(r"\b\w+\b", chunk.lower())
+                tokens = re.findall(r"\\b\\w+\\b", chunk.lower())
 
                 # Filter out stopwords and numbers
                 filtered_tokens = [
@@ -3053,7 +3364,7 @@ def analyze_token_frequencies(
                 chunks_with_token = sum(
                     1
                     for chunk in chunks
-                    if re.search(r"\b" + re.escape(token) + r"\b", chunk.lower())
+                    if re.search(r"\\b" + re.escape(token) + r"\\b", chunk.lower())
                 )
                 percentage = (chunks_with_token / total_chunks) * 100
                 token_percentages[token] = percentage
@@ -3512,6 +3823,177 @@ def analyze_high_zscore_steps_by_category(
     print(f"Data saved to {csv_path}")
 
 
+def analyze_response_length_statistics(
+    correct_rollouts_dir: Path = None,
+    incorrect_rollouts_dir: Path = None,
+    output_dir: Path = None,
+) -> None:
+    """
+    Analyze response length statistics in sentences and tokens with 95% confidence intervals.
+    Combines data from both correct and incorrect rollouts for aggregate statistics.
+
+    Args:
+        correct_rollouts_dir: Directory containing correct rollout data
+        incorrect_rollouts_dir: Directory containing incorrect rollout data
+        output_dir: Directory to save analysis results
+    """
+    print("Analyzing response length statistics across all rollouts...")
+
+    # Create analysis directory
+    analysis_dir = output_dir / "response_length_analysis"
+    analysis_dir.mkdir(exist_ok=True, parents=True)
+
+    # Collect response length data from both correct and incorrect rollouts
+    sentence_lengths = []
+    token_lengths = []
+
+    # Process correct rollouts if provided
+    if correct_rollouts_dir and correct_rollouts_dir.exists():
+        problem_dirs = sorted(
+            [
+                d
+                for d in correct_rollouts_dir.iterdir()
+                if d.is_dir() and d.name.startswith("problem_")
+            ]
+        )
+
+        for problem_dir in tqdm(
+            problem_dirs, desc="Processing correct rollouts for length analysis"
+        ):
+            base_solution_file = problem_dir / "base_solution.json"
+            if not base_solution_file.exists():
+                continue
+
+            try:
+                with open(base_solution_file, "r", encoding="utf-8") as f:
+                    base_solution = json.load(f)
+
+                full_cot = base_solution.get("full_cot", "")
+                if not full_cot:
+                    continue
+
+                # Count sentences
+                sentences = split_solution_into_chunks(full_cot)
+                sentence_lengths.append(len(sentences))
+
+                # Count tokens
+                num_tokens = count_tokens(full_cot, approximate=False)
+                token_lengths.append(num_tokens)
+
+            except Exception as e:
+                print(f"Error processing correct rollout {problem_dir.name}: {e}")
+                continue
+
+    # Process incorrect rollouts if provided
+    if incorrect_rollouts_dir and incorrect_rollouts_dir.exists():
+        problem_dirs = sorted(
+            [
+                d
+                for d in incorrect_rollouts_dir.iterdir()
+                if d.is_dir() and d.name.startswith("problem_")
+            ]
+        )
+
+        for problem_dir in tqdm(
+            problem_dirs, desc="Processing incorrect rollouts for length analysis"
+        ):
+            base_solution_file = problem_dir / "base_solution.json"
+            if not base_solution_file.exists():
+                continue
+
+            try:
+                with open(base_solution_file, "r", encoding="utf-8") as f:
+                    base_solution = json.load(f)
+
+                full_cot = base_solution.get("full_cot", "")
+                if not full_cot:
+                    continue
+
+                # Count sentences
+                sentences = split_solution_into_chunks(full_cot)
+                sentence_lengths.append(len(sentences))
+
+                # Count tokens
+                num_tokens = count_tokens(full_cot, approximate=False)
+                token_lengths.append(num_tokens)
+
+            except Exception as e:
+                print(f"Error processing incorrect rollout {problem_dir.name}: {e}")
+                continue
+
+    # Skip if no data collected
+    if not sentence_lengths or not token_lengths:
+        print("No response length data collected")
+        return
+
+    # Calculate statistics
+    sentence_lengths = np.array(sentence_lengths)
+    token_lengths = np.array(token_lengths)
+
+    # Calculate means
+    mean_sentences = np.mean(sentence_lengths)
+    mean_tokens = np.mean(token_lengths)
+
+    # Calculate 95% confidence intervals using t-distribution
+
+    # For sentences
+    sentence_sem = stats.sem(sentence_lengths)
+    sentence_ci = stats.t.interval(
+        0.95, len(sentence_lengths) - 1, loc=mean_sentences, scale=sentence_sem
+    )
+
+    # For tokens
+    token_sem = stats.sem(token_lengths)
+    token_ci = stats.t.interval(
+        0.95, len(token_lengths) - 1, loc=mean_tokens, scale=token_sem
+    )
+
+    # Create the summary string
+    summary_text = (
+        f"The average response is {mean_sentences:.1f} sentences long "
+        f"(95% CI: [{sentence_ci[0]:.1f}, {sentence_ci[1]:.1f}]; "
+        f"this corresponds to {mean_tokens:.0f} tokens "
+        f"[95% CI: {token_ci[0]:.0f}, {token_ci[1]:.0f}])."
+    )
+
+    # Print the result
+    print(f"\n{summary_text}")
+
+    # Save detailed statistics
+    stats_data = {
+        "num_responses": len(sentence_lengths),
+        "sentences": {
+            "mean": float(mean_sentences),
+            "std": float(np.std(sentence_lengths)),
+            "median": float(np.median(sentence_lengths)),
+            "min": int(np.min(sentence_lengths)),
+            "max": int(np.max(sentence_lengths)),
+            "ci_95_lower": float(sentence_ci[0]),
+            "ci_95_upper": float(sentence_ci[1]),
+            "sem": float(sentence_sem),
+        },
+        "tokens": {
+            "mean": float(mean_tokens),
+            "std": float(np.std(token_lengths)),
+            "median": float(np.median(token_lengths)),
+            "min": int(np.min(token_lengths)),
+            "max": int(np.max(token_lengths)),
+            "ci_95_lower": float(token_ci[0]),
+            "ci_95_upper": float(token_ci[1]),
+            "sem": float(token_sem),
+        },
+        "summary": summary_text,
+    }
+
+    # Save to JSON file
+    stats_file = analysis_dir / "response_length_stats.json"
+    with open(stats_file, "w", encoding="utf-8") as f:
+        json.dump(stats_data, f, indent=2)
+
+    print(f"Response length analysis saved to {analysis_dir}")
+    print(f"Statistics saved to {stats_file}")
+
+
 # -----------------------------------------------------------------------------------------------------------------------------------------------
 
 
@@ -3780,6 +4262,33 @@ def main():
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     cache_root = Path(args.hf_cache_dir)
+
+    # Apply optional HF timeout overrides early, before any HF calls
+    def _apply_hf_overrides_from_args():
+        changed = False
+        # If a blanket override is provided, apply to all
+        if args.hf_timeout_all is not None:
+            _bump_hf_timeouts(int(args.hf_timeout_all))
+            changed = True
+
+        # Apply per-field overrides if provided
+        def _set_if(name: str, val: Optional[int]):
+            nonlocal changed
+            if val is not None:
+                try:
+                    cur = int(os.environ.get(name, "0"))
+                except Exception:
+                    cur = 0
+                os.environ[name] = str(max(cur, int(val)))
+                changed = True
+
+        _set_if("HF_HUB_READ_TIMEOUT", args.hf_read_timeout)
+        _set_if("HF_HUB_CONNECT_TIMEOUT", args.hf_connect_timeout)
+        _set_if("HF_HUB_ETAG_TIMEOUT", args.hf_etag_timeout)
+        if changed:
+            _reset_hf_http_session()
+
+    _apply_hf_overrides_from_args()
 
     # Resolve each input (local path or hf://)
     correct_dir = (

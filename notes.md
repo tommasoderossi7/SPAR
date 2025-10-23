@@ -30,6 +30,24 @@ Next tasks:
         - testing without any LLM-based labeling --- DONE
         - run v5 and handle the too many requests rate limit --- DONE
         - navigate the results
+            - useful plots for now (excluding all the by category analyses):
+                - explore/chunk_accuracy_by_position.png (prob forced accuracy by position, to investigate more)
+                - plots/importance_by_position.png (chunk importance by position)
+                - variance_analysis/chunk_variance.txt (chunks sorted by importance, chunks of the base greedy completion or base not interveened  condition completion (which temperature?))
+                - variance_analysis/within_problem_variance.txt most important chunks for every problem
+            - things to investigate:
+                - counterfactual accuracy (probably top1 accuracy, against correct answer or base completion answer?)
+                - counterfactual kl (which 2 distributions is the kl computed for? I presume base completion distribution over final answers and cunterfactual completions distribution over final answers)
+                - overdeterminedness (what is overdeterminedness and from which input is it computed?)
+                - explore/chunk_accuracy_by_position.png (the accuracy is forced accuracy, accuracy against correct answer or base completion answer?)
+                - difference between the correct_base_solution and incorrect_base_solution analyses (are they just 2 base completions sampled with some temperature different from 0, where one is correct answer and the other is incorrect answer?)
+
+            - questions after investigation:
+                - why is the next chunk accuracy used? And why it is not used instead the accuracy of current chunk similar completions?
+                    - because the counterfactual accuracy is meant to measure the differences between deviations from current completion and the current completion, and the current completion distribution in the case the current chunk is kept is the distribution over answers at the next chunk completions sampling, not between dissimar and similar completions
+                - in 4) the resempling accuracy against ground truth is it also considering similar alternative chunks completions or only dissimilar alternative chunks completions?
+                - in 5) why then problem_330 it is both inside correct_base_solution and incorrect_base_solution?
+
 
     - take a look at sampled completions from forking paths 
     - ensure the information saved is sufficient for all later analysis (degree of overlap and threshold based CoT decomposition)
@@ -122,7 +140,7 @@ Cosine similarity threshold to decide “similar vs dissimilar” resampled chun
 --use_similar_chunks/--no-use_similar_chunks
 Whether to include “similar” resamples when building the comparison distribution for KL metrics.
 
---use_prob_true/--no-use_prob_true
+--use_prob_true (store_true)
 If on, KL is computed over P(correct) (binary). If off, KL is over the full answer distribution.
 
 Embeddings / performance
