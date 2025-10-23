@@ -44,13 +44,23 @@ Next tasks:
 
             - questions after investigation:
                 - why is the next chunk accuracy used? And why it is not used instead the accuracy of current chunk similar completions?
-                    - because the counterfactual accuracy is meant to measure the differences between deviations from current completion and the current completion, and the current completion distribution in the case the current chunk is kept is the distribution over answers at the next chunk completions sampling, not between dissimar and similar completions
+                    - because the counterfactual accuracy is meant to measure the differences between deviations from current completion and the current completion. Then the current completion distribution should consider the cases where the current chunk is kept that's why it is the distribution over answers at the next chunk completions sampling, not between dissimar and similar completions at the current chunk
                 - in 4) the resempling accuracy against ground truth is it also considering similar alternative chunks completions or only dissimilar alternative chunks completions?
+                    - it is considering both (all completions)
                 - in 5) why then problem_330 it is both inside correct_base_solution and incorrect_base_solution?
+                    - because the base solution is just a completion with no intervention of the model and since they used temperature 0.6 it can in some cases be correct and in some others incorrect.
 
+
+            - questions about the comparison:
+                - why not to apply for the on-policy baseline the next token distribution based comparison in the same way it is done with the chunks (sentences)?
+                - isn't it needed to apply a dissimilarity threshold at the token level case too?
+                - how is the base completion enforced for the 2 methods by the comparison script?
+                - why you say that the is not a notion of dissimilarity at a token level? There is and it would be the cosine similairity between token embeddings. But even if there is I probably wouldnìt use it: if a similar alternative token push the model away from the correct answer I want to know it, and hence I want the original token to be assigned a high importance. Does it make sense? Why at the same level the authors of the paper didn't apply this line of reasoning?
 
     - take a look at sampled completions from forking paths 
     - ensure the information saved is sufficient for all later analysis (degree of overlap and threshold based CoT decomposition)
+    - implement the degree of overlap comparison:
+        - check the last answer in the chat (https://chatgpt.com/c/68f76fd4-c27c-8325-b9cd-545cc4fb2571)
     - start the full sampling (topk = 10 - minp = 0.05)
     - test generate_rollouts.py
 
@@ -65,6 +75,7 @@ Next tasks:
     - use the obtained forking indices as decompositions boundaries and apply thought anchors black box attribution method on such a decomposition, automatically label each unit (LLM-based functional labeling) and compare with the results obtained in the thought anchors paper
 
 - consider ways to reduce the costs of the forking paths approach
+
 
 
 

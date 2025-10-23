@@ -41,3 +41,23 @@ print("R_HOME seen by rpy2:", s.get_r_home())
 ro.r('library(Rbeast)')
 print("Rbeast OK in rpy2")
 PY
+
+
+
+Run the comparison:
+
+# 1) Run token script (with the code additions) → produces:
+#    math_rollouts/<model>/samples_<S>_topk_<K>_prob_<p>/problem_XXX/rollout_analysis.json
+python -m forking_tokens.generate_rollout -atk 10 -amp 0.05 -sps 30
+
+# 2) Run your chunk pipeline as before (correct &/or incorrect), e.g.:
+python -m thought_anchors.analyze_rollouts
+
+# 3) Compare (point to the sentence rollouts (not the analysis dir) so we can read base_solution.json and chunks.json)
+python comparison.py
+  --token_root math_rollouts/deepseek_deepseek-r1-distill-qwen-14b/samples_30_topk_10_prob_0.05
+  --chunk_correct_root math_rollouts/deepseek-r1-distill-qwen-14b/temperature_0.6_top_p_0.95/correct_base_solution
+  --chunk_incorrect_root math_rollouts/deepseek-r1-distill-qwen-14b/temperature_0.6_top_p_0.95/incorrect_base_solution
+  --top_tokens 0
+  --top_sentences 5
+  --out comparison_out
