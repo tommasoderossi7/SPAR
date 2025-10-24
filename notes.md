@@ -61,20 +61,75 @@ Next tasks:
     - ensure the information saved is sufficient for all later analysis (degree of overlap and threshold based CoT decomposition)
     - implement the degree of overlap comparison:
         - check the last answer in the chat (https://chatgpt.com/c/68f76fd4-c27c-8325-b9cd-545cc4fb2571)
-    - start the full sampling (topk = 10 - minp = 0.05)
+        - modify forking_tokens/generate_rollout such that the base completion is read from the thought anchors generated data (huggingface)
+        - I think the procedure should just be: we have a base completion that we copy from the base completion, for every token index where there are alternative tokens (within top k and with min probability minp and different from the base completion token) we sample --samples-per-fork samples for every possible token at the current index (base token + alternative tokens) by forcing each of the possible token by concatenating them to the CoT up until current token. Then we use the --samples-per-fork samples of the base completion token as the intervention condition to compute the distribution over the final answers, and the --samples-per-fork for every alternative token to compute a distribution over final answers where the contribution of samples coming from each alternative token is weighted by the alternative token probability. These 2 distributions are the 2 distributions over which we compute counterfactual KL divergence (over the 2 full distributions or over p(true) for the 2 cases). The same data is also used to compute the counterfactual accuracy. This is the sampling method that feel closest to the methods applied for the sentences. Another possibility would be to not force the alternative tokens but just to sample --samples-per-fork applying logit bias such that the base completion token probability to be sampled is 0 (as close as possible to 0). This way we would just need --samples-per-fork for all alternative tokens (not for each of them) and we would not need to weight the contributions by alternative token probability and just compute the distribution over final answers from this sample of alternative completions (hence saving computation on the number of samples required).
+
+    - test forking_tokens.generate_rollout_v3 in the 2 modes with --alternate-top-k 2 --alternate-min-prob 0.45 --samples-per-fork 2
+
+    - implement the base completion for the token level analysis coming from the hugging face thought anchors dataset
+    - make the base completion for the token level analysis coming from the hugging face thought anchors dataset
+
+    - implement the comparison.py script
+    - test the comparison.py script
+
+    - run the full sampling (topk = 10 - minp = 0.05)
+    
+    - 1) compute the degree of overlap/correlation between the forking indices (sorted by importance (magnitude of the drift)) and most counterfactually important units(sentences) on the same set of 3 problems.
+
+    - 2) set a threshold for choosing which are the forking indices such that decomposition obtained by segmenting the CoT at those indices has the same number of units of the sentence-level decomposition used in thought anchors. And then compare these 2 decompositions, if they both split the CoT similarly then the thought anchors sentence-level decomposition is a natural way to split the CoT (it respects the model reasoning structure), otherwise although it being a human readable decomposition it doesn’t follow how the model perceive the different pieces of a CoT.
+    
+    - apply black box attribution method from thought anchors to this new decomposition, if possible label the chunks with the same taxonomy used in thought anchors and compare the results
+    
     - test generate_rollouts.py
 
     - compute precise estimation of costs for problem_330 and compare with costs of forking tokens on the same problem
 
+    - empirically calculate the sampling cost of forking tokens
 
-- empirically calculate the sampling cost of forking tokens
-- empirically calculate the sampling cost of thought anchors
+    - empirically calculate the sampling cost of thought anchors
 
-- 1) compute the degree of overlap/correlation between the forking indices (sorted by importance (magnitude of the drift)) and most counterfactually important units(sentences) on the same set of 3 problems.
-- 2) integrate bayesian CPD to infer the forking indices
-    - use the obtained forking indices as decompositions boundaries and apply thought anchors black box attribution method on such a decomposition, automatically label each unit (LLM-based functional labeling) and compare with the results obtained in the thought anchors paper
+    - consider ways to reduce the costs of the forking paths approach
 
-- consider ways to reduce the costs of the forking paths approach
+
+
+
+
+
+
+
+
+
+
+
+
+CALL Thought anchors analyzer of hugging face datasets
+
+python -m thought_anchors.analyze_rollouts_v5  --correct_rollouts_dir hf://uzaymacar/math-rollouts/deepseek-r1-distill-qwen-14b/temperature_0.6_top_p_0.95/correct_base_solution  --incorrect_rollouts_dir hf://uzaymacar/math-rollouts/deepseek-r1-distill-qwen-14b/temperature_0.6_top_p_0.95/incorrect_base_solution  --llm_provider none  --importance_metric counterfactual_importance_accuracy  --use_existing_metrics  --problems "330"
+
+
+CALL Forking tokens generate rollouts_v3.py
+
+Mode 1 (expensive): samples-per-fork samples for every base + alternative tokens
+python -m forking_tokens.generate_rollout_v3 \
+  --intervention-mode forced \
+  --samples-per-fork 30 \
+  --alternate-top-k 10 \
+  --alternate-min-prob 0.05 \
+  --problem-substring "3(1+3(1+3(1+3(1+3(1+3(1+3(1+3(1+3(1+3)))))))))" \
+  --model "deepseek/deepseek-r1-distill-qwen-14b" \
+  --concurrency 50
+
+Mode 2 (cheap): samples-per-fork samples for base and samples-per-fork samples for alternative tokens all together
+python -m forking_tokens.generate_rollout_v3 \
+  --intervention-mode biased \
+  --samples-per-fork 30 \
+  --alternate-top-k 10 \
+  --alternate-min-prob 0.05 \
+  --problem-substring "3(1+3(1+3(1+3(1+3(1+3(1+3(1+3(1+3(1+3)))))))))" \
+  --model "deepseek/deepseek-r1-distill-qwen-14b" \
+  --concurrency 50
+
+
 
 
 
@@ -91,11 +146,6 @@ Next tasks:
 
 Substring to match
 3(1+3(1+3(1+3(1+3(1+3(1+3(1+3(1+3(1+3)))))))))
-
-CALL Thought anchors analyzer of hugging face datasets
-python -m thought_anchors.analyze_rollouts_v5  --correct_rollouts_dir hf://uzaymacar/math-rollouts/deepseek-r1-distill-qwen-14b/temperature_0.6_top_p_0.95/correct_base_solution  --incorrect_rollouts_dir hf://uzaymacar/math-rollouts/deepseek-r1-distill-qwen-14b/temperature_0.6_top_p_0.95/incorrect_base_solution  --llm_provider none  --importance_metric counterfactual_importance_accuracy  --use_existing_metrics  --problems "330"
-
-
 
 
 
