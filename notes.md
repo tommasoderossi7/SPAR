@@ -64,15 +64,18 @@ Next tasks:
         - modify forking_tokens/generate_rollout such that the base completion is read from the thought anchors generated data (huggingface)
         - I think the procedure should just be: we have a base completion that we copy from the base completion, for every token index where there are alternative tokens (within top k and with min probability minp and different from the base completion token) we sample --samples-per-fork samples for every possible token at the current index (base token + alternative tokens) by forcing each of the possible token by concatenating them to the CoT up until current token. Then we use the --samples-per-fork samples of the base completion token as the intervention condition to compute the distribution over the final answers, and the --samples-per-fork for every alternative token to compute a distribution over final answers where the contribution of samples coming from each alternative token is weighted by the alternative token probability. These 2 distributions are the 2 distributions over which we compute counterfactual KL divergence (over the 2 full distributions or over p(true) for the 2 cases). The same data is also used to compute the counterfactual accuracy. This is the sampling method that feel closest to the methods applied for the sentences. Another possibility would be to not force the alternative tokens but just to sample --samples-per-fork applying logit bias such that the base completion token probability to be sampled is 0 (as close as possible to 0). This way we would just need --samples-per-fork for all alternative tokens (not for each of them) and we would not need to weight the contributions by alternative token probability and just compute the distribution over final answers from this sample of alternative completions (hence saving computation on the number of samples required).
 
+    - implement the base completion for the token level analysis coming from the hugging face thought anchors dataset
+        - missing point 5) from chatgpt chat
+        - ensure that when k = 0 it gets resampled with the sam prefix
+        - v4 stable but without progressive save, v5_cleaned with progressive save but to test
+        - if in v5_cleaned chatgpt fucked up / used approximate logic (run it and read summary from chagpt answer: https://chatgpt.com/c/68f76fd4-c27c-8325-b9cd-545cc4fb2571), go back to v4 version (in the chat modify the questions where I asked to give me the progressive save logic and re-do the question specifying to be clear on where to insert the different updated parts, do the insertions to v4 and create v5)
+
     - test forking_tokens.generate_rollout_v3 in the 2 modes with --alternate-top-k 2 --alternate-min-prob 0.45 --samples-per-fork 2
 
-    - implement the base completion for the token level analysis coming from the hugging face thought anchors dataset
-    - make the base completion for the token level analysis coming from the hugging face thought anchors dataset
+    - run the full sampling (topk = 10 - minp = 0.05)
 
     - implement the comparison.py script
     - test the comparison.py script
-
-    - run the full sampling (topk = 10 - minp = 0.05)
     
     - 1) compute the degree of overlap/correlation between the forking indices (sorted by importance (magnitude of the drift)) and most counterfactually important units(sentences) on the same set of 3 problems.
 
@@ -107,27 +110,13 @@ CALL Thought anchors analyzer of hugging face datasets
 python -m thought_anchors.analyze_rollouts_v5  --correct_rollouts_dir hf://uzaymacar/math-rollouts/deepseek-r1-distill-qwen-14b/temperature_0.6_top_p_0.95/correct_base_solution  --incorrect_rollouts_dir hf://uzaymacar/math-rollouts/deepseek-r1-distill-qwen-14b/temperature_0.6_top_p_0.95/incorrect_base_solution  --llm_provider none  --importance_metric counterfactual_importance_accuracy  --use_existing_metrics  --problems "330"
 
 
-CALL Forking tokens generate rollouts_v3.py
+CALL Forking tokens generate rollouts_v4.py
 
 Mode 1 (expensive): samples-per-fork samples for every base + alternative tokens
-python -m forking_tokens.generate_rollout_v3 \
-  --intervention-mode forced \
-  --samples-per-fork 30 \
-  --alternate-top-k 10 \
-  --alternate-min-prob 0.05 \
-  --problem-substring "3(1+3(1+3(1+3(1+3(1+3(1+3(1+3(1+3(1+3)))))))))" \
-  --model "deepseek/deepseek-r1-distill-qwen-14b" \
-  --concurrency 50
+python -m forking_tokens.generate_rollout_v4  --intervention-mode forced  --samples-per-fork 2  --alternate-top-k 2  --alternate-min-prob 0.45  --problem-substring "3(1+3(1+3(1+3(1+3(1+3(1+3(1+3(1+3(1+3)))))))))"  --model "deepseek/deepseek-r1-distill-qwen-14b"  --concurrency 50  --external-base-root thought_anchors/.cache/math_rollouts_hf  --external-base-kind correct_base_solution  --external-use-prompt
 
 Mode 2 (cheap): samples-per-fork samples for base and samples-per-fork samples for alternative tokens all together
-python -m forking_tokens.generate_rollout_v3 \
-  --intervention-mode biased \
-  --samples-per-fork 30 \
-  --alternate-top-k 10 \
-  --alternate-min-prob 0.05 \
-  --problem-substring "3(1+3(1+3(1+3(1+3(1+3(1+3(1+3(1+3(1+3)))))))))" \
-  --model "deepseek/deepseek-r1-distill-qwen-14b" \
-  --concurrency 50
+python -m forking_tokens.generate_rollout_v4  --intervention-mode biased  --samples-per-fork 2  --alternate-top-k 2  --alternate-min-prob 0.45  --problem-substring "3(1+3(1+3(1+3(1+3(1+3(1+3(1+3(1+3(1+3)))))))))"  --model "deepseek/deepseek-r1-distill-qwen-14b"  --concurrency 50
 
 
 
