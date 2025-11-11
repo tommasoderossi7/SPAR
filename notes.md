@@ -70,14 +70,134 @@ Next tasks:
         - v4 stable but without progressive save, v5_cleaned with progressive save but to test
         - if in v5_cleaned chatgpt fucked up / used approximate logic (run it and read summary from chagpt answer: https://chatgpt.com/c/68f76fd4-c27c-8325-b9cd-545cc4fb2571), go back to v4 version (in the chat modify the questions where I asked to give me the progressive save logic and re-do the question specifying to be clear on where to insert the different updated parts, do the insertions to v4 and create v5)
 
-    - test forking_tokens.generate_rollout_v3 in the 2 modes with --alternate-top-k 2 --alternate-min-prob 0.45 --samples-per-fork 2
+    - Now I am questioning whether it is needed the alignment to the external based process implemented by align_to_external_base(). If it is not needed for the subsequent sampling with either intervention mode we should avoid it: it is very time and tokens consuming. 
+    In the biased case we just need to:
+        1) sample samples-per-fork completions in the biased case using as prefix the completion until the base completion current token (excluded) (control)
+        2) sample samples-per-fork completions without imposing any bias using as prefix the completion until the base completion current token (included) (intervention)
+
+    In the forced case we just need to:
+        0) using as prefix the completion until the base completion current token (excluded) get the base completion (topk) next tokens probabilities
+        1) sample samples-per-fork completions for every token between the topk with probability > minp 
+        2) use the samples-per-fork of the base completion token to compute the outcome distribution (intervention)
+        3) use the samples-per-fork of each alternative tokens forced completions to compute the outcome distribution with alternative tokens contribution weighted by alternative token probability.
+
+    Considering these current 2 alternatives I don't see the need for the costly align_to_external_base(), am I not considering anything for which the alignment is important or is it indeed unnecessary?
+    If it's unnecessary give me an updated script which skip that and just implement only the needed parts of the logic.
+
+    - handle api rate limits
+    - ensure bias doesn't work
+    - save alternative tokens and their probabilties in a common reusable file in C:\Users\Tommaso Derossi\OneDrive\Desktop\SPAR\SPAR\math_rollouts\deepseek_deepseek-r1-distill-qwen-14b\problem_{problem_id} such that I don't have to do the lookup calls everytime the script is run with different samples per fork, topk and min probability
+    - solve error 524
+
+    - test forking_tokens.generate_rollout_v5_cleaned in the 2 modes with --alternate-top-k 2 --alternate-min-prob 0.45 --samples-per-fork 2
 
     - run the full sampling (topk = 10 - minp = 0.05)
 
+    - ask chatgpt how to make the script faster considering that the biggest bottleneck is the api calls response time, does it make sense to try to find the optimal concurrency number or that wouldn't affect that much the 
+    script execution time? What else can be done to speed up the process as much as possible?
+
     - implement the comparison.py script
+        prompt (3) was not included to not confuse the model):
+            now we need to work on the comparison script which is meant to compare the results obtained from the token level analysis (tokens counterfactual importance measured as kl divergence between the intervention and control conditions) with the results obtained from the sentence level analysis (sentence counterfactual importance measured as kl divergence between the intervention and control conditions (where the control condition is composed by completions outcomes obtained from sampled dissimilar sentences)). 
+            Three comparisons should be made:
+            1) To what extent most important sentences and most important tokens overlap (by overlapping we mean whether the token is contained in the sentence). This question should test how much important tokens are contained in importance sentences.
+            2) If we decompose the base completion chain of thought by splitting it at the N-1 most important tokens where N is the number of sentences obtained by decomposing the chain of thought in sentences, how much similar this obtained decomposition is with the sentence level decomposition?
+            3) If we compute with this newly obtained data driven decomposition the counterfactual importance of each piece how the most important units obtained in this way relate with the most important sentences obtained with the sentence level analysis? 
+
+            piece of the json from sentence level analysis
+
+            piece of the json from token level analysis
+
+
+    - find a workaround to do the new pass with stream for uncomplete branches without overloading the json with new unnecessary fields and without the need to rerun the sampling and modifying too much the code. --- DONE
+
+
+
+
     - test the comparison.py script
     
     - 1) compute the degree of overlap/correlation between the forking indices (sorted by importance (magnitude of the drift)) and most counterfactually important units(sentences) on the same set of 3 problems.
+
+    instead of doing max do max of absolute value 
+
+HERE
+
+    do the actual most important units overlap
+
+    check that indeed with the sentence level decomposition the most disruptive plausible alternative trajectories get excluded (by the cosine similarity dissimilarity criteria)
+        - compare the top importance values for the sentence level decomposition with those of the token level analysis --- DONE
+        - compute sentence importance without the dissimilarity criteria (and check if the importances grow somehow somewhere)
+    add the comparison also with running thought anchors analyze rollouts with both use_pro_true and without (rn comparing only with "delta_acc": "counterfactual_importance_accuracy")
+
+    reason about other ways of computing the correlation 
+        - show the correlation measures (spearman and pearson) and the correlation graph also for avg --- DONE
+        - top k most important token top k most importance sentences overlap (where overlap is whether a token is (at least partially contained in a sentence))
+
+    
+IMPORTANT
+    something is wrong with the alignment with the base solution (I need to fix that)
+        - check precompute_and_cache_base_topk() in generate_rollouts_v25_gemini.py
+            - check if the prefix at every token index is correct or if it uses the prefix with possibly diverged sampling tokens (if the latter is the case all the later samples could be wrong, no we in the bias case we just need the correct prefix and the correct base token)
+                - the prefix is correct
+        - now I need to identify the token_indices in the rollout generated where the token in the base case does not match the token in the base completion at that step and resample the 2 branches at those indices (the base case should you the token from the base completion and the _ALT_POOL_ should sample with the bias on the token of the base completion)
+            - sample_fork_branches is presumably adjusted, now we need to resample the branches that differ
+                - check if it's correct to put entry["branches"] = []
+                - recover 
+                    remaining = sum(_pending_samples_for_entry(e) for e in merged_steps)
+                    w_star_raw = entry.get("token_raw")
+                    w_star_clean = entry.get("token")
+                    p_w_star = float(entry.get("probability") or 0.0)
+                    if binfo["needs_resampling"]:
+                        # If the base token has changed, we need to resample all prior attempts
+                        successes_so_far = 0
+                        errors_so_far = 0
+                        entry["branches"] = []
+                - delete
+                    remaining = 1
+                    token_indices_to_resample = 0
+                    total_token_indices_w_valid_alt = 0
+                    w_star_raw = base_completion_text_raw[
+                        offs[entry["token_index"]][0] : offs[entry["token_index"]][1]
+                    ]
+                    w_star_clean = _clean_token_display(w_star_raw)
+                    p_w_star = (
+                        [
+                            float(c.get("probability") or 0.0)
+                            for c in (entry.get("top_candidates") or [])
+                            if c.get("token_raw") == w_star_raw or c.get("token") == w_star_clean
+                        ][0]
+                        if any(
+                            c.get("token_raw") == w_star_raw or c.get("token") == w_star_clean
+                            for c in (entry.get("top_candidates") or [])
+                        )
+                        else 0.0
+                    )
+                    ids, offs = _tokenize_with_offsets(base_completion_text_raw)
+                    "needs_resampling": True
+                    if w_star_raw != entry.get("token_raw")
+                    or w_star_clean != entry.get("token")
+                    else False,
+                    if binfo["needs_resampling"]:
+                        token_indices_to_resample += 1
+                        print(
+                            f"[info] Resampling branch token '{entry['token']}' at t={entry['token_index']} due to base token change. The base completion token was '{w_star_clean}' instead of '{entry.get('token')}'."
+                        )
+                    print(
+                        f"\n\n token indices to resample over total indices with valid alternatives: {token_indices_to_resample} / {total_token_indices_w_valid_alt}\n\n"
+                    )
+                    
+
+    
+    run the first save batch and check if correct what gets saved in the rollout_analysis.json file
+
+    check if the text offsets of the modified branches reflect the correct tokens length (base completion tokens, not current wrong tokens)
+
+    don't normalize the importance in the decomposition side-by-side comparison html
+
+    write my challenges and open questions & next steps (30 mins in total tomorrow morning)
+
+
+
 
     - 2) set a threshold for choosing which are the forking indices such that decomposition obtained by segmenting the CoT at those indices has the same number of units of the sentence-level decomposition used in thought anchors. And then compare these 2 decompositions, if they both split the CoT similarly then the thought anchors sentence-level decomposition is a natural way to split the CoT (it respects the model reasoning structure), otherwise although it being a human readable decomposition it doesn’t follow how the model perceive the different pieces of a CoT.
     
@@ -95,13 +215,26 @@ Next tasks:
 
 
 
+# working version of precompute_and_cache_base_topk() in v14
 
 
+v24 final good (500 concurrency, 0.8 rpm)
+
+25 with resample (300 concurrency, 1.6 rpm)
 
 
+python -m forking_tokens.generate_rollout_v2  --intervention-mode biased  --samples-per-fork 30  --alternate-top-k 10  --alternate-min-prob 0.05  --include-problems 330  --model "deepseek/deepseek-r1-distill-qwen-14b"  --concurrency 1000  --requests-per-second 1.6  --max-retries 5  --external-base-root thought_anchors/.cache/math_rollouts_hf  --external-kind correct_base_solution
 
 
+python -m forking_tokens.generate_rollout_v15_claude  --intervention-mode biased  --samples-per-fork 30  --alternate-top-k 10  --alternate-min-prob 0.05  --include-problems 330  --model "deepseek/deepseek-r1-distill-qwen-14b"  --concurrency 10  --requests-per-second 0.8  --max-retries 5  --external-base-root thought_anchors/.cache/math_rollouts_hf  --external-kind correct_base_solution
 
+
+python -m forking_tokens.generate_rollout_v7_noalign  --intervention-mode forced  --samples-per-fork 2  --alternate-top-k 2  --alternate-min-prob 0.45  --include-problems 330  --model "deepseek/deepseek-r1-dis
+till-qwen-14b"  --concurrency 50  --external-base-root thought_anchors/.cache/math_rollouts_hf  --external-kind correct_base_solution --verify-bias False
+
+
+python -m forking_tokens.generate_rollout_v5_cleaned  --intervention-mode forced  --samples-per-fork 2  --alternate-top-k 2  --alternate-min-prob 0.45  --include-problems 330  --model "deepseek/deepseek-r1-dis
+till-qwen-14b"  --concurrency 50  --external-base-root thought_anchors/.cache/math_rollouts_hf  --external-kind correct_base_solution
 
 
 

@@ -4,7 +4,6 @@
 #   • Base next-token top-k cache: saves after every token updated
 #   • Intervention sampling: merges with existing rollout & saves after each batch
 
-import sys
 import os
 import re
 import json
@@ -825,21 +824,9 @@ async def precompute_and_cache_base_topk(
             "t": t,
             "text_offset": int(offs[t][0]),
             "base": {
-                # token should be the token in the base completion not just the top candidate
-                "token_raw": base_completion[offs[t][0] : offs[t][1]],
-                "token": _clean_token_display(base_completion[offs[t][0] : offs[t][1]]),
-                "probability": [
-                    float(c.get("probability") or 0.0)
-                    for c in (entry.get("top_candidates") or [])
-                    if c.get("token")
-                    == _clean_token_display(base_completion[offs[t][0] : offs[t][1]])
-                ]
-                if any(
-                    c.get("token")
-                    == _clean_token_display(base_completion[offs[t][0] : offs[t][1]])
-                    for c in (entry.get("top_candidates") or [])
-                )
-                else 0.0,
+                "token_raw": entry["token_raw"],
+                "token": entry["token"],
+                "probability": float(entry["probability"] or 0.0),
             },
             "candidates": [
                 {
@@ -938,7 +925,7 @@ def _existing_branch_map(entry: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
     for br in entry.get("branches", []) or []:
         tok = br.get("token")
         if isinstance(tok, str):
-            out[str(entry["token_index"]) + tok] = br
+            out[tok] = br
     return out
 
 
@@ -989,19 +976,19 @@ def _pending_samples_for_entry(entry: Dict[str, Any]) -> int:
     if len(valid_alts) == 0:
         return 0
     w_star = entry.get("token")
-    br_star = existing.get(str(entry["token_index"]) + w_star, {})
+    br_star = existing.get(w_star, {})
     have_star = len(br_star.get("samples", []) or [])
     if have_star < args.samples_per_fork:
         need += args.samples_per_fork - have_star
     if args.intervention_mode == "forced":
         for c in valid_alts:
             tok = c["token"]
-            prev = existing.get(str(entry["token_index"]) + tok, {})
+            prev = existing.get(tok, {})
             have = len(prev.get("samples", []) or [])
             if have < args.samples_per_fork:
                 need += args.samples_per_fork - have
     else:
-        pool = existing.get(str(entry["token_index"]) + "__ALT_POOL__", {})
+        pool = existing.get("__ALT_POOL__", {})
         have = len(pool.get("samples", []) or [])
         if have < args.samples_per_fork:
             need += args.samples_per_fork - have
@@ -1116,72 +1103,39 @@ async def sample_fork_branches(
     # per-branch live state: (t_idx, branch_token) -> dict of counters
     branch_state: Dict[Tuple[int, str], Dict[str, int]] = {}
 
-    ids, offs = _tokenize_with_offsets(base_completion_text_raw)
-    alt_pool_total_samples_needed = 0
-    base_token_total_samples_needed = 0
-
     for entry in token_entries:
         entry.setdefault("branches", [])
         existing_map = _existing_branch_map(entry)
-
-        # t_offset = int(entry.get("text_offset") or 0)
-
-        w_star_raw = base_completion_text_raw[
-            offs[entry["token_index"]][0] : offs[entry["token_index"]][1]
-        ]
-        w_star_clean = _clean_token_display(w_star_raw)
-        p_w_star = (
-            [
-                float(c.get("probability") or 0.0)
-                for c in (entry.get("top_candidates") or [])
-                if c.get("token") == w_star_clean
-            ][0]
-            if any(
-                c.get("token") == w_star_clean
-                for c in (entry.get("top_candidates") or [])
-            )
-            else 0.0
-        )
-        # w_star_raw = entry.get("token_raw")
-        # w_star_clean = entry.get("token")
-        # p_w_star = float(entry.get("probability") or 0.0)
-        if w_star_clean != entry.get("token"):
-            entry["top_candidates"].append(
-                {
-                    "token_raw": entry["token_raw"],
-                    "token": entry["token"],
-                    "probability": entry["probability"],
-                }
-            )
 
         valid_alts = [
             c
             for c in (entry.get("top_candidates") or [])
             if is_safe_to_fork(c.get("token_raw"))
             and float(c.get("probability") or 0.0) >= args.alternate_min_prob
-            and c.get("token") != w_star_clean
+            and c.get("token") != entry.get("token")
         ]
+
+        t_offset = int(entry.get("text_offset") or 0)
+        w_star_raw = entry.get("token_raw")
+        w_star_clean = entry.get("token")
+        p_w_star = float(entry.get("probability") or 0.0)
+
         # Only sample baseline if there will be at least one alt (forced) or a pool (biased)
         should_sample_baseline = len(valid_alts) > 0
 
         branches_to_check: List[Dict[str, Any]] = []
 
-        if should_sample_baseline:
-            if entry.get("token") != w_star_clean:
-                print(
-                    f"[info] Planning BASE branch for token '{w_star_clean}' at t={entry['token_index']}"
+        if should_sample_baseline and is_safe_to_fork(w_star_raw):
+            greedy_text = detok_for_api(w_star_raw)
+            if greedy_text:
+                branches_to_check.append(
+                    {
+                        "token_clean": w_star_clean,
+                        "prob": p_w_star,
+                        "fork_prompt": f"{prompt}{base_completion_text_raw[:t_offset]}{greedy_text}",
+                        "logit_bias": None,
+                    }
                 )
-            branches_to_check.append(
-                {
-                    "token_clean": w_star_clean,
-                    "prob": p_w_star,
-                    "fork_prompt": f"{prompt}{base_completion_text_raw[: offs[entry['token_index']][0]]}{w_star_clean}",
-                    "logit_bias": None,
-                    "needs_resampling": True
-                    if w_star_clean != entry.get("token")
-                    else False,
-                }
-            )
             entry["valid_alternatives"] = {
                 c["token"]: c["probability"] for c in valid_alts
             }
@@ -1196,36 +1150,26 @@ async def sample_fork_branches(
                         {
                             "token_clean": c["token"],
                             "prob": float(c.get("probability") or 0.0),
-                            "fork_prompt": f"{prompt}{base_completion_text_raw[: offs[entry['token_index']][0]]}{alt_text}",
+                            "fork_prompt": f"{prompt}{base_completion_text_raw[:t_offset]}{alt_text}",
                             "logit_bias": None,
-                            "needs_resampling": True
-                            if w_star_clean != entry.get("token")
-                            else False,
                         }
                     )
         elif args.intervention_mode == "biased" and len(valid_alts) > 0:
             tid = token_raw_to_id(w_star_raw)
             bias = {tid: -100} if isinstance(tid, int) else None
-            if entry.get("token") != w_star_clean:
-                print(
-                    f"[info] Planning ALT_POOL branch for token '{w_star_clean}' at t={entry['token_index']}"
-                )
             branches_to_check.append(
                 {
                     "token_clean": "__ALT_POOL__",
                     "prob": sum(float(c.get("probability") or 0.0) for c in valid_alts),
-                    "fork_prompt": f"{prompt}{base_completion_text_raw[: offs[entry['token_index']][0]]}",
+                    "fork_prompt": f"{prompt}{base_completion_text_raw[:t_offset]}",
                     "logit_bias": bias,
-                    "needs_resampling": True
-                    if w_star_clean != entry.get("token")
-                    else False,
                 }
             )
 
         # Plan per-branch based on SUCCESSFUL samples only
         for binfo in branches_to_check:
             tok_clean = binfo["token_clean"]
-            br = existing_map.get(str(entry["token_index"]) + tok_clean)
+            br = existing_map.get(tok_clean)
             if br is None:
                 br = {
                     "token": tok_clean,
@@ -1236,7 +1180,7 @@ async def sample_fork_branches(
                     "logit_bias": binfo["logit_bias"],
                 }
                 entry["branches"].append(br)
-                existing_map[str(entry["token_index"]) + tok_clean] = br
+                existing_map[tok_clean] = br
             else:
                 # Backfill for resumes from older checkpoints
                 br.setdefault("fork_prompt", binfo["fork_prompt"])
@@ -1252,17 +1196,6 @@ async def sample_fork_branches(
                 for s in (br.get("samples") or [])
                 if isinstance(s, dict) and s.get("error")
             )
-
-            if binfo["needs_resampling"]:
-                # If the base token has changed, we need to resample all prior attempts
-                successes_so_far = 0
-                errors_so_far = 0
-                if tok_clean == "__ALT_POOL__":
-                    # recreate the pool branch
-                    alt_pool_total_samples_needed += args.samples_per_fork
-                else:
-                    base_token_total_samples_needed += args.samples_per_fork
-
             attempts_completed = successes_so_far + errors_so_far
             need_success = max(0, args.samples_per_fork - successes_so_far)
 
@@ -1276,9 +1209,7 @@ async def sample_fork_branches(
                 "issued": 0,  # total launched so far
                 "target": args.samples_per_fork,
             }
-            entry["token"] = w_star_clean  # ensure base token is up to date
-            entry["probability"] = p_w_star
-            entry["text_offset"] = offs[entry["token_index"]][0]
+
             if need_success > 0:
                 next_idx = attempts_completed
                 for i in range(need_success):
@@ -1296,11 +1227,9 @@ async def sample_fork_branches(
                     }
                     requests_to_make.append(req)
                     branch_state[key]["queued"] += 1  # queued, not inflight yet
-    print(
-        f"[info] Total base token samples needed: {base_token_total_samples_needed}\n"
-    )
-    print(f"[info] Total alt pool samples needed: {alt_pool_total_samples_needed}\n")
-    print(f"[info] Total requests planned: {len(requests_to_make)}\n\n")
+        entry["token"] = w_star_clean
+        entry["token_raw"] = w_star_raw
+        entry["probability"] = p_w_star
     # Fast exit if nothing to do: scrub & compute metrics once and save.
     if not requests_to_make:
 
@@ -1335,7 +1264,7 @@ async def sample_fork_branches(
     # -------------------------------
     # PHASE 2: STREAM EXECUTION LOOP
     # -------------------------------
-    SAVE_INTERVAL = 60  # save every N completions
+    SAVE_INTERVAL = 300  # save every N completions
     # Keep pipeline equal to semaphore capacity to avoid backlogged tasks
     IN_FLIGHT = max(1, int(getattr(args, "concurrency", 1)))
     MAX_ATTEMPTS_PAD = max(10, args.samples_per_fork // 2)
@@ -1606,7 +1535,6 @@ async def sample_fork_branches(
                 result_sink["token_steps"] = token_entries
                 result_sink["status"] = "fork_sampling_in_progress"
                 safe_write_json(rollout_file, result_sink)
-                sys.exit(0)
 
         # keep the pipeline full (bounded to semaphore capacity)
         _launch(max(0, IN_FLIGHT - len(inflight_tasks)))
@@ -2194,8 +2122,7 @@ async def run_problem(problem_idx: int, *, semaphore: asyncio.Semaphore) -> None
     safe_write_json(rollout_file, result)
 
     # 2) Branch sampling (progressive saves inside sampling)
-    # remaining = sum(_pending_samples_for_entry(e) for e in merged_steps)
-    remaining = 1
+    remaining = sum(_pending_samples_for_entry(e) for e in merged_steps)
     if remaining > 0 or args.force:
         await sample_fork_branches(
             problem_idx,
